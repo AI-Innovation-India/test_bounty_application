@@ -1,0 +1,7 @@
+{
+  "project_path": "D:\\game_development\\test_sprite_agent\\demo_target",
+  "test_directory": "D:\\game_development\\test_sprite_agent\\demo_target\\testsprite_tests",
+  "browser": "chromium",
+  "headless": false,
+  "timeout": 30000
+}

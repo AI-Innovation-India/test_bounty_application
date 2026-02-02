@@ -1,0 +1,82 @@
+# Claude/Agent files
+.agent/
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+# Python lib directories (not src/lib)
+/lib/
+/lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+venv/
+.venv/
+ENV/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Next.js
+.next/
+out/
+
+# Build
+build/
+dist/
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.pem
+*.log
+.vercel
+
+# Test artifacts (keep structure but not content)
+test_sprite_agent/runs/*/
+!test_sprite_agent/runs/.gitkeep
+
+# Large files
+*.mp4
+*.mov
+*.avi
+*.mkv
+Recording*.mp4
+
+# Other projects in parent (if any)
+3d-landing-page/
+nul
+My_requirement.md

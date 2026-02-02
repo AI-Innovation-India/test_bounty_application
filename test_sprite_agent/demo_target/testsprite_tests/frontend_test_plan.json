@@ -1,0 +1,12 @@
+{
+  "type": "frontend",
+  "scenarios": [
+    {
+      "id": "mock_1",
+      "name": "Mock Load",
+      "steps": [
+        "Open Page"
+      ]
+    }
+  ]
+}

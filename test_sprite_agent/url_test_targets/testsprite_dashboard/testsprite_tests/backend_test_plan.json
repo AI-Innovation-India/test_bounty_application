@@ -1,0 +1,11 @@
+{
+  "type": "backend",
+  "scenarios": [
+    {
+      "id": "mock_api_1",
+      "name": "Mock API Call",
+      "endpoint": "/api",
+      "method": "GET"
+    }
+  ]
+}

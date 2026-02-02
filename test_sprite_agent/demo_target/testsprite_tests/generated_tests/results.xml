@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="pytest" errors="0" failures="0" skipped="0" tests="1" time="2.057" timestamp="2026-01-28T19:37:38.911422" hostname="DESKTOP-G2GFNKN"><testcase classname="demo_target.testsprite_tests.generated_tests.test_generated_001" name="test_homepage_title" time="2.002" /></testsuite></testsuites>

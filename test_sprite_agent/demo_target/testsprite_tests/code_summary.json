@@ -1,0 +1,33 @@
+{
+  "project_path": "D:\\game_development\\test_sprite_agent\\demo_target",
+  "structure": {
+    "files": [
+      "package.json",
+      "README.md",
+      "testsprite_tests/backend_test_plan.json",
+      "testsprite_tests/code_summary.json",
+      "testsprite_tests/config.json",
+      "testsprite_tests/frontend_test_plan.json",
+      "testsprite_tests/standard_prd.json",
+      "testsprite_tests/generated_tests/results.xml",
+      "testsprite_tests/generated_tests/test_generated_001.py",
+      "testsprite_tests/reports/report.html",
+      "testsprite_tests/reports/report.md"
+    ],
+    "directories": [
+      "testsprite_tests",
+      "testsprite_tests/generated_tests",
+      "testsprite_tests/logs",
+      "testsprite_tests/reports",
+      "testsprite_tests/generated_tests/videos"
+    ]
+  },
+  "tech_stack": {
+    "language": "JavaScript/TypeScript",
+    "framework": "React",
+    "dependencies": [
+      "react",
+      "express"
+    ]
+  }
+}

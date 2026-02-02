@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+ENV/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Environment
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Test run data (keep directory structure)
+runs/*/
+!runs/.gitkeep
+
+# Temporary runs
+temp_runs/
+
+# Debug files
+debug_videos/
+debug_*.py
+check_models.py
+filter_models.py
+find_best_model.py
+list_models.py
+read_models.py
+manual_debug_flow.py
+models.txt
+clean_models.txt
+
+# Logs
+*.log
+
+# Video files (large)
+*.webm
+*.mp4

@@ -1,0 +1,3 @@
+{
+  "error": "Navigation failed: Page.goto: Timeout 30000ms exceeded.\nCall log:\n  - navigating to \"https://www.testsprite.com/dashboard\", waiting until \"networkidle\"\n"
+}
