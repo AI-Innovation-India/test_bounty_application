@@ -34,7 +34,7 @@ export default function DocsPage() {
             <main className="flex-1 ml-64 p-8">
                 <header className="flex items-center justify-between mb-8">
                     <div className="flex items-center gap-2 text-sm text-slate-500">
-                        <span className="text-slate-300">AI Test Studio</span>
+                        <span className="text-slate-300">TestBounty</span>
                         <span>/</span>
                         <span className="text-white">Documentation</span>
                     </div>
@@ -44,7 +44,7 @@ export default function DocsPage() {
                     <div className="mb-10 text-center">
                         <h1 className="text-3xl font-bold text-white mb-4">Documentation</h1>
                         <p className="text-slate-400 max-w-2xl mx-auto">
-                            Everything you need to know about using AI Test Studio to automate your quality assurance workflows.
+                            Everything you need to know about using TestBounty to automate your quality assurance workflows.
                         </p>
                     </div>
 

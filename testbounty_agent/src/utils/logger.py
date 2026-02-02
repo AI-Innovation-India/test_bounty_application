@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-def setup_logger(name: str = "test_sprite", log_file: Optional[Path] = None, level: int = logging.INFO) -> logging.Logger:
+def setup_logger(name: str = "testbounty", log_file: Optional[Path] = None, level: int = logging.INFO) -> logging.Logger:
     """
     Configure and return a standard logger.
     """

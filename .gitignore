@@ -66,8 +66,8 @@ Thumbs.db
 .vercel
 
 # Test artifacts (keep structure but not content)
-test_sprite_agent/runs/*/
-!test_sprite_agent/runs/.gitkeep
+testbounty_agent/runs/*/
+!testbounty_agent/runs/.gitkeep
 
 # Large files
 *.mp4

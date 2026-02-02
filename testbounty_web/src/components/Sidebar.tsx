@@ -33,9 +33,9 @@ export default function Sidebar() {
         <aside className="w-64 border-r border-white/5 bg-[#0A0A0B] flex flex-col fixed h-full z-20">
             <div className="p-6 flex items-center gap-3">
                 <div className="w-8 h-8 rounded bg-gradient-to-br from-[#00D4AA] to-emerald-600 flex items-center justify-center font-bold text-black text-xs">
-                    AT
+                    TB
                 </div>
-                <span className="font-bold tracking-tight text-white">AI Test Studio</span>
+                <span className="font-bold tracking-tight text-white">TestBounty</span>
             </div>
 
             <nav className="flex-1 px-4 space-y-8 overflow-y-auto">

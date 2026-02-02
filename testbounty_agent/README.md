@@ -1,8 +1,8 @@
-# TestSprite: Autonomous AI Quality Assurance Agent
+# TestBounty: Autonomous AI Quality Assurance Agent
 
 > **"Zero-Code, Full-Cycle QA Automation powered by Generative AI."**
 
-TestSprite is an advanced AI agent designed to autonomously plan, write, and execute end-to-end (E2E) tests for web applications. By simply providing a target URL, TestSprite acts as a virtual QA Engineer, analyzing the application, generating comprehensive test strategies, and engaging in self-healing code execution—all without human intervention.
+TestBounty is an advanced AI agent designed to autonomously plan, write, and execute end-to-end (E2E) tests for web applications. By simply providing a target URL, TestBounty acts as a virtual QA Engineer, analyzing the application, generating comprehensive test strategies, and engaging in self-healing code execution—all without human intervention.
 
 ---
 
@@ -33,7 +33,7 @@ Our goal is to **eliminate the bottleneck of manual testing** in modern software
 - **Video Recording**: Captures every test run for visual debugging.
 
 ### 🖥️ Modern "Cyberpunk" UI
-- Built with **Next.js 14** and **Tailwind CSS**.
+- Built with **Next.js 16** and **Tailwind CSS**.
 - Features a dark, high-contrast interface for clarity.
 - **Interactive Chat**: Talk to the Agent to ask questions about the test results or request new scenarios.
 
@@ -43,7 +43,7 @@ Our goal is to **eliminate the bottleneck of manual testing** in modern software
 
 | Component | Technology | Role |
 | :--- | :--- | :--- |
-| **Frontend** | Next.js 14, React, Tailwind | User Dashboard & Execution/Chat UI |
+| **Frontend** | Next.js 16, React, Tailwind | User Dashboard & Execution/Chat UI |
 | **Backend** | FastAPI (Python) | API Server, Job Management, Artifact Serving |
 | **AI / LLM** | LangChain, LangGraph, Google Gemini | Reasoning, Planning, Code Generation |
 | **Automation** | Playwright (Python) | Browser Control & Video Recording |
@@ -54,7 +54,7 @@ Our goal is to **eliminate the bottleneck of manual testing** in modern software
 ## 📦 Project Structure
 
 ```bash
-/test_sprite_agent         # 🧠 The Brain (Backend)
+/testbounty_agent         # 🧠 The Brain (Backend)
 ├── src/
 │   ├── agents/           # LangGraph workflows (Plan -> Code -> Run)
 │   ├── services/         # LLM & Playwright services
@@ -63,7 +63,7 @@ Our goal is to **eliminate the bottleneck of manual testing** in modern software
 ├── demo_target/          # Simple target app for self-testing
 └── runs.json             # Local database of test runs
 
-/test_sprite_web          # 💻 The Face (Frontend)
+/testbounty_web          # 💻 The Face (Frontend)
 ├── src/app/              # Next.js App Router pages
 ├── components/           # UI Components (Sidebar, CodeViewer)
 └── lib/api.ts            # Backend API client
@@ -76,7 +76,7 @@ Our goal is to **eliminate the bottleneck of manual testing** in modern software
 ### 1. Backend Setup
 Navigate to the agent directory and start the API server:
 ```bash
-cd test_sprite_agent
+cd testbounty_agent
 
 # Install dependencies (requires Python 3.10+)
 pip install -e .
@@ -93,7 +93,7 @@ python -m src.api_server
 ### 2. Frontend Setup
 Navigate to the web directory and start the UI:
 ```bash
-cd test_sprite_web
+cd testbounty_web
 npm install
 npm run dev
 ```
@@ -108,4 +108,4 @@ npm run dev
 - [ ] **Mobile Testing**: Appium integration for mobile apps.
 
 ---
-*Built with ❤️ by the TestSprite Team.*
+*Built with ❤️ by the TestBounty Team.*
