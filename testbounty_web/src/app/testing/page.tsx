@@ -15,6 +15,7 @@ export default function AllTestsPage() {
     const [loading, setLoading] = useState(true);
     const [openMenuId, setOpenMenuId] = useState<string | null>(null);
     const [deleting, setDeleting] = useState<string | null>(null);
+    const [selectedRuns, setSelectedRuns] = useState<Set<string>>(new Set());
     const menuRef = useRef<HTMLDivElement>(null);
 
     useEffect(() => {
@@ -58,15 +59,47 @@ export default function AllTestsPage() {
         }
     };
 
+    const toggleSelectAll = () => {
+        if (selectedRuns.size === runs.length) {
+            setSelectedRuns(new Set());
+        } else {
+            setSelectedRuns(new Set(runs.map(r => r.id)));
+        }
+    };
+
+    const toggleSelectRun = (runId: string) => {
+        const newSelected = new Set(selectedRuns);
+        if (newSelected.has(runId)) {
+            newSelected.delete(runId);
+        } else {
+            newSelected.add(runId);
+        }
+        setSelectedRuns(newSelected);
+    };
+
     const handleDeleteAll = async () => {
-        if (!confirm("Are you sure you want to delete ALL test runs? This action cannot be undone.")) return;
+        const countToDelete = selectedRuns.size > 0 ? selectedRuns.size : runs.length;
+        const message = selectedRuns.size > 0
+            ? `Are you sure you want to delete ${countToDelete} selected test run(s)?`
+            : "Are you sure you want to delete ALL test runs? This action cannot be undone.";
+
+        if (!confirm(message)) return;
+
         setLoading(true);
         try {
-            await deleteAllRuns();
-            setRuns([]);
+            if (selectedRuns.size > 0) {
+                // Delete only selected runs
+                await Promise.all(Array.from(selectedRuns).map(id => deleteRun(id)));
+                setRuns(runs.filter(r => !selectedRuns.has(r.id)));
+                setSelectedRuns(new Set());
+            } else {
+                // Delete all runs
+                await deleteAllRuns();
+                setRuns([]);
+            }
         } catch (e) {
-            console.error("Failed to delete all:", e);
-            alert("Failed to delete all runs");
+            console.error("Failed to delete:", e);
+            alert("Failed to delete runs");
         } finally {
             setLoading(false);
         }
@@ -120,7 +153,8 @@ export default function AllTestsPage() {
                                 onClick={handleDeleteAll}
                                 className="bg-red-500/10 hover:bg-red-500/20 text-red-400 px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 border border-red-500/20 transition-colors"
                             >
-                                <Trash2 size={16} /> Delete All
+                                <Trash2 size={16} />
+                                {selectedRuns.size > 0 ? `Delete Selected (${selectedRuns.size})` : 'Delete All'}
                             </button>
                         )}
                         <Link href="/">
@@ -136,7 +170,14 @@ export default function AllTestsPage() {
                     <table className="w-full text-left text-sm">
                         <thead className="bg-[#0F0F11] border-b border-white/5 text-slate-500 font-medium">
                             <tr>
-                                <th className="px-6 py-4 w-12"><input type="checkbox" className="rounded border-slate-700 bg-transparent" /></th>
+                                <th className="px-6 py-4 w-12">
+                                    <input
+                                        type="checkbox"
+                                        checked={runs.length > 0 && selectedRuns.size === runs.length}
+                                        onChange={toggleSelectAll}
+                                        className="rounded border-slate-700 bg-transparent cursor-pointer"
+                                    />
+                                </th>
                                 <th className="px-6 py-4">Test Name</th>
                                 <th className="px-6 py-4">Type</th>
                                 <th className="px-6 py-4">Latest Status</th>
@@ -148,7 +189,14 @@ export default function AllTestsPage() {
                         <tbody className="divide-y divide-white/5">
                             {runs.map((run) => (
                                 <tr key={run.id} className="group hover:bg-white/[0.02] transition-colors">
-                                    <td className="px-6 py-4"><input type="checkbox" className="rounded border-slate-700 bg-transparent" /></td>
+                                    <td className="px-6 py-4">
+                                        <input
+                                            type="checkbox"
+                                            checked={selectedRuns.has(run.id)}
+                                            onChange={() => toggleSelectRun(run.id)}
+                                            className="rounded border-slate-700 bg-transparent cursor-pointer"
+                                        />
+                                    </td>
                                     <td className="px-6 py-4">
                                         <Link href={`/run/${run.id}`} className="block">
                                             <div className="font-medium text-white mb-1 group-hover:text-[#00D4AA] transition-colors truncate max-w-xs">

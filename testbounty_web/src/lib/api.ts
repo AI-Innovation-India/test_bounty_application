@@ -255,3 +255,168 @@ export async function runMonitorNow(monitorId: string): Promise<{ status: string
     if (!res.ok) throw new Error('Failed to run monitor');
     return res.json();
 }
+
+// =============================================
+// EXPLORER & PLANNER API (Scenario Testing)
+// =============================================
+
+export interface TestPlan {
+    id: string;
+    url: string;
+    status: 'exploring' | 'planning' | 'ready' | 'failed';
+    created_at: string;
+    completed_at?: string;
+    app_map?: {
+        base_url: string;
+        total_pages: number;
+        pages: any[];
+        modules: Record<string, any>;
+        auth_pages: string[];
+    };
+    test_plan?: {
+        base_url: string;
+        total_scenarios: number;
+        modules: Record<string, {
+            name: string;
+            requires_auth: boolean;
+            scenarios: any[];
+        }>;
+    };
+    error?: string;
+}
+
+export async function exploreUrl(url: string, maxPages: number = 30): Promise<{ explore_id: string; status: string }> {
+    const res = await fetch(`${API_BASE}/explore`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, max_pages: maxPages }),
+    });
+    if (!res.ok) throw new Error('Failed to start exploration');
+    return res.json();
+}
+
+export async function getPlans(): Promise<TestPlan[]> {
+    const res = await fetch(`${API_BASE}/plans`);
+    if (!res.ok) throw new Error('Failed to list plans');
+    return res.json();
+}
+
+export async function getPlan(planId: string): Promise<TestPlan> {
+    const res = await fetch(`${API_BASE}/plans/${planId}`);
+    if (!res.ok) throw new Error('Plan not found');
+    return res.json();
+}
+
+export async function deletePlan(planId: string): Promise<{ status: string; plan_id: string }> {
+    const res = await fetch(`${API_BASE}/plans/${planId}`, {
+        method: 'DELETE',
+    });
+    if (!res.ok) throw new Error('Failed to delete plan');
+    return res.json();
+}
+
+export async function runScenarios(
+    planId: string,
+    scenarioIds: string[] = []
+): Promise<{ run_id: string; status: string; scenarios_count: number }> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scenario_ids: scenarioIds }),
+    });
+    if (!res.ok) throw new Error('Failed to run scenarios');
+    return res.json();
+}
+
+export async function runModule(
+    planId: string,
+    moduleName: string
+): Promise<{ run_id: string; status: string; scenarios_count: number }> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ module: moduleName }),
+    });
+    if (!res.ok) throw new Error('Failed to run module');
+    return res.json();
+}
+
+// =============================================
+// SCENARIO RUN VIDEO & CODE API
+// =============================================
+
+export function getScenarioVideoUrl(runId: string, scenarioId: string): string {
+    return `${API_BASE}/scenario-run/${runId}/video/${scenarioId}`;
+}
+
+export function getScenarioVideoFileUrl(runId: string, filename: string): string {
+    return `${API_BASE}/scenario-run/${runId}/video-file/${filename}`;
+}
+
+export async function listScenarioVideos(runId: string): Promise<{
+    videos: { filename: string; url: string; size: number }[];
+}> {
+    const res = await fetch(`${API_BASE}/scenario-run/${runId}/videos`);
+    if (!res.ok) throw new Error('Failed to list videos');
+    return res.json();
+}
+
+export async function getScenarioCode(
+    runId: string,
+    scenarioId: string
+): Promise<{ scenario_id: string; scenario_name: string; code: string; language: string }> {
+    const res = await fetch(`${API_BASE}/scenario-run/${runId}/code/${scenarioId}`);
+    if (!res.ok) throw new Error('Failed to get scenario code');
+    return res.json();
+}
+
+export async function getAllScenarioCode(runId: string): Promise<{
+    run_id: string;
+    scenarios_count: number;
+    code: string;
+    language: string;
+}> {
+    const res = await fetch(`${API_BASE}/scenario-run/${runId}/code`);
+    if (!res.ok) throw new Error('Failed to get all scenario code');
+    return res.json();
+}
+
+// Unified API object for easier imports
+export const api = {
+    // Runs
+    startRun,
+    getRunStatus,
+    listRuns,
+    getRunArtifact,
+    getExecutionProgress,
+    deleteRun,
+    deleteAllRuns,
+    getScreenshotUrl,
+    getTestVideoUrl,
+    getTestCode,
+    getReportDownloadUrl,
+
+    // Test Suites
+    listTestSuites,
+    createTestSuite,
+    getTestSuite,
+    updateTestSuite,
+    deleteTestSuite,
+    runTestSuite,
+
+    // Monitors
+    listMonitors,
+    createMonitor,
+    getMonitor,
+    updateMonitor,
+    deleteMonitor,
+    runMonitorNow,
+
+    // Explorer & Planner
+    exploreUrl,
+    getPlans,
+    getPlan,
+    deletePlan,
+    runScenarios,
+    runModule,
+};

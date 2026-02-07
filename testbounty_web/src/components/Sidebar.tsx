@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
     Home, List, Activity, Settings,
-    User, Zap, LogOut, Trash2
+    User, Zap, LogOut, Trash2, Target
 } from "lucide-react";
 import { deleteAllRuns } from "@/lib/api";
 
@@ -47,6 +47,7 @@ export default function Sidebar() {
 
                 <div>
                     <div className="text-xs font-semibold text-slate-500 mb-2 px-2 tracking-wider">TESTING</div>
+                    <NavItem icon={<Target size={18} />} label="Scenarios" href="/scenarios" active={isActive("/scenarios")} />
                     <NavItem icon={<Zap size={18} />} label="Create Tests" href="/create" active={isActive("/create")} />
                     <NavItem icon={<List size={18} />} label="All Tests" href="/testing" active={isActive("/testing")} />
                     <NavItem icon={<List size={18} />} label="Test Suites" href="/test-lists" active={isActive("/test-lists")} />
