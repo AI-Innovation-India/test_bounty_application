@@ -931,9 +931,19 @@ async def run_plan_scenarios(plan_id: str, request: RunScenariosRequest, backgro
 
 async def run_scenarios_task(run_id: str, base_url: str, scenarios: List[Dict]):
     """Background task to execute test scenarios."""
-    from playwright.async_api import async_playwright
+    import platform
+    from concurrent.futures import ThreadPoolExecutor
 
     logger.info(f"Starting scenario run {run_id} with {len(scenarios)} scenarios")
+
+    # On Windows, use sync version in thread pool to avoid NotImplementedError
+    if platform.system() == 'Windows':
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as executor:
+            await loop.run_in_executor(executor, run_scenarios_task_sync, run_id, base_url, scenarios)
+        return
+
+    from playwright.async_api import async_playwright
 
     RUNS[run_id]["status"] = "running"
     save_runs()
@@ -1002,6 +1012,181 @@ async def run_scenarios_task(run_id: str, base_url: str, scenarios: List[Dict]):
         RUNS[run_id]["error"] = str(e)
 
     save_runs()
+
+
+def run_scenarios_task_sync(run_id: str, base_url: str, scenarios: List[Dict]):
+    """Synchronous version for Windows - Background task to execute test scenarios."""
+    from playwright.sync_api import sync_playwright
+
+    RUNS[run_id]["status"] = "running"
+    save_runs()
+
+    results = {}
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={'width': 1280, 'height': 720},
+                record_video_dir=f"./temp_runs/{run_id}/videos"
+            )
+
+            # Check if we need to login first
+            auth_scenario = None
+            for s in scenarios:
+                if s.get("depends_on"):
+                    # Find the auth scenario
+                    auth_scenario = next(
+                        (sc for sc in scenarios if sc["id"] == s["depends_on"]),
+                        None
+                    )
+                    break
+
+            # Run auth scenario first if needed
+            if auth_scenario:
+                page = context.new_page()
+                result = execute_scenario_sync(page, auth_scenario, base_url)
+                results[auth_scenario["id"]] = result
+                # Keep page open for subsequent tests that need auth
+
+            # Run each scenario
+            for scenario in scenarios:
+                if scenario.get("id") == (auth_scenario["id"] if auth_scenario else None):
+                    continue  # Already ran auth
+
+                page = context.new_page()
+
+                try:
+                    result = execute_scenario_sync(page, scenario, base_url)
+                    results[scenario["id"]] = result
+
+                    # Update progress
+                    RUNS[run_id]["results"] = results
+                    save_runs()
+
+                except Exception as e:
+                    results[scenario["id"]] = {
+                        "status": "failed",
+                        "error": str(e)
+                    }
+
+                finally:
+                    page.close()
+
+            browser.close()
+
+        RUNS[run_id]["status"] = "completed"
+        RUNS[run_id]["results"] = results
+        RUNS[run_id]["completed_at"] = datetime.now().isoformat()
+
+    except Exception as e:
+        logger.error(f"Scenario run {run_id} failed: {e}")
+        RUNS[run_id]["status"] = "failed"
+        RUNS[run_id]["error"] = str(e)
+
+    save_runs()
+
+
+def execute_scenario_sync(page, scenario: Dict, base_url: str) -> Dict:
+    """Synchronous version for Windows - Execute a single test scenario and return results."""
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
+    scenario_result = {
+        "id": scenario["id"],
+        "name": scenario["name"],
+        "status": "running",
+        "steps_completed": [],
+        "error": None
+    }
+
+    try:
+        for step in scenario.get("steps", []):
+            action = step["action"]
+            target = step["target"]
+            value = step.get("value")
+
+            if action == "navigate":
+                url = target if target.startswith("http") else f"{base_url}{target}"
+                page.goto(url, wait_until="networkidle", timeout=15000)
+
+            elif action == "fill":
+                # Try multiple selectors
+                selectors = target.split(", ")
+                filled = False
+                for selector in selectors:
+                    try:
+                        elem = page.wait_for_selector(selector.strip(), timeout=3000)
+                        if elem:
+                            elem.fill(value or "")
+                            filled = True
+                            break
+                    except:
+                        continue
+                if not filled:
+                    raise Exception(f"Could not find element: {target}")
+
+            elif action == "click":
+                selectors = target.split(", ")
+                clicked = False
+                for selector in selectors:
+                    try:
+                        elem = page.wait_for_selector(selector.strip(), timeout=3000)
+                        if elem:
+                            elem.click()
+                            clicked = True
+                            break
+                    except:
+                        continue
+                if not clicked:
+                    raise Exception(f"Could not click element: {target}")
+
+            elif action == "wait":
+                if target == "navigation":
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                else:
+                    page.wait_for_timeout(2000)
+
+            elif action == "assert":
+                # Simple assertions
+                if target == "page_loaded":
+                    assert page.title(), "Page did not load"
+                elif target == "url_changed":
+                    pass  # URL assertion handled implicitly
+                elif target == "error_message_visible":
+                    # Look for common error indicators
+                    error_selectors = [".error", ".alert-danger", "[role='alert']", ".text-red", ".text-danger"]
+                    found = False
+                    for sel in error_selectors:
+                        try:
+                            elem = page.query_selector(sel)
+                            if elem and elem.is_visible():
+                                found = True
+                                break
+                        except:
+                            continue
+                    assert found, "Expected error message not found"
+                elif target.startswith("element_visible:"):
+                    selector = target.replace("element_visible:", "")
+                    elem = page.wait_for_selector(selector, timeout=5000)
+                    assert elem and elem.is_visible(), f"Element {selector} not visible"
+
+            scenario_result["steps_completed"].append({
+                "action": action,
+                "target": target,
+                "value": value,
+                "status": "passed"
+            })
+
+        scenario_result["status"] = "passed"
+
+    except PlaywrightTimeout as e:
+        scenario_result["status"] = "failed"
+        scenario_result["error"] = f"Timeout: {str(e)}"
+    except Exception as e:
+        scenario_result["status"] = "failed"
+        scenario_result["error"] = str(e)
+
+    return scenario_result
 
 
 async def execute_scenario(page, scenario: Dict, base_url: str) -> Dict:
