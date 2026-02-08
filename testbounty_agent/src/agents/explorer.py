@@ -7,10 +7,13 @@ import asyncio
 import json
 import platform
 import sys
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, TYPE_CHECKING
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin, urlparse
 import re
+
+if TYPE_CHECKING:
+    from playwright.async_api import Page, Browser
 
 
 class ExplorerAgent:
