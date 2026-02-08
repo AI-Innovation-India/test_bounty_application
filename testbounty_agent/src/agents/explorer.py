@@ -3,17 +3,16 @@ Explorer Agent - Discovers and maps the entire application
 Crawls all pages, identifies forms, buttons, links, and groups into modules
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import platform
 import sys
-from typing import Dict, List, Optional, Any, TYPE_CHECKING
+from typing import Dict, List, Optional, Any
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urljoin, urlparse
 import re
-
-if TYPE_CHECKING:
-    from playwright.async_api import Page, Browser
 
 
 class ExplorerAgent:
