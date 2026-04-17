@@ -1,7 +1,14 @@
 """
-Planner Agent - Creates test scenarios based on Explorer results
-Generates modular test cases with dependencies
+Planner Agent - Creates test scenarios based on Explorer results + AppKnowledge.
+
+Two modes:
+  - LLM mode  : uses AppKnowledge + LLM to generate domain-aware, role-specific
+                scenarios that reflect real business logic.
+  - Template mode: deterministic fallback when no LLM is available; generates
+                   scenarios from page-type heuristics (original behaviour).
 """
+
+from __future__ import annotations
 
 import json
 from typing import Dict, List, Any, Optional
@@ -69,9 +76,18 @@ class PlannerAgent:
         self.scenarios: List[TestScenario] = []
         self.scenario_counter = 0
 
+    def generate_scenarios_with_knowledge(
+        self,
+        app_knowledge: Dict[str, Any],
+        llm_service,
+    ) -> Dict[str, Any]:
+        """LLM-powered generation using AppKnowledge context."""
+        agent = KnowledgePlannerAgent(self.app_map, app_knowledge, llm_service)
+        return agent.generate()
+
     def generate_scenarios(self) -> Dict[str, Any]:
         """
-        Generate all test scenarios for the application
+        Generate all test scenarios for the application (template-based fallback).
         """
         # Generate scenarios for each module
         for module_name, module_data in self.modules.items():
@@ -508,12 +524,163 @@ class PlannerAgent:
                 ))
 
 
-def generate_test_plan(app_map: Dict[str, Any]) -> Dict[str, Any]:
+def generate_test_plan(
+    app_map: Dict[str, Any],
+    app_knowledge: Optional[Dict[str, Any]] = None,
+    llm_service=None,
+) -> Dict[str, Any]:
     """
-    Convenience function to generate test plan from app map
+    Generate a test plan from an app map.
+
+    When `app_knowledge` and `llm_service` are provided the planner uses the
+    LLM to generate context-aware, domain-specific scenarios.  Otherwise it
+    falls back to the deterministic template-based approach.
     """
     planner = PlannerAgent(app_map)
+
+    # LLM-powered path
+    if app_knowledge and llm_service and getattr(llm_service, "provider", "mock") != "mock":
+        try:
+            return planner.generate_scenarios_with_knowledge(app_knowledge, llm_service)
+        except Exception as e:
+            # If LLM fails for any reason, fall back silently
+            import logging
+            logging.getLogger(__name__).warning(
+                f"LLM scenario generation failed, falling back to templates: {e}"
+            )
+
+    # Template-based path (original behaviour)
     return planner.generate_scenarios()
+
+
+class KnowledgePlannerAgent:
+    """
+    LLM-driven scenario generator that understands *what* the app does,
+    not just *what elements* are on the page.
+    """
+
+    def __init__(self, app_map: Dict[str, Any], app_knowledge: Dict[str, Any], llm_service):
+        self.app_map = app_map
+        self.knowledge = app_knowledge
+        self.llm = llm_service
+        self.base_url = app_map.get("base_url", "")
+
+    def generate(self) -> Dict[str, Any]:
+        """Main entry point — calls LLM to produce a rich scenario plan."""
+        from src.agents.skills_loader import get_skills_loader
+
+        pages_summary = [
+            {
+                "path": p.get("path", ""),
+                "type": p.get("type", ""),
+                "title": p.get("title", ""),
+                "forms": [
+                    {
+                        "id": f.get("id", ""),
+                        "fields": [{"name": fld.get("name"), "type": fld.get("type"), "selector": fld.get("selector")} for fld in f.get("fields", [])],
+                        "submit_selector": f.get("submit_selector", ""),
+                    }
+                    for f in p.get("forms", [])
+                ],
+                "buttons": [b.get("text", "") for b in p.get("buttons", [])[:6]],
+                "requires_auth": p.get("requires_auth", False),
+            }
+            for p in self.app_map.get("pages", [])
+        ]
+
+        k = self.knowledge
+
+        # Load domain skills context — gives LLM expert testing knowledge for this domain
+        skills_context = get_skills_loader().get_skills_for_context(
+            domain=k.get("domain", ""),
+            vocabulary=k.get("domain_vocabulary", []),
+            app_description=k.get("app_description", ""),
+        )
+
+        prompt = f"""You are a senior QA engineer generating comprehensive Playwright test scenarios.
+
+=== APPLICATION KNOWLEDGE ===
+Domain        : {k.get('domain', 'web-application')}
+Description   : {k.get('app_description', '')}
+Key Features  : {json.dumps(k.get('key_features', []))}
+User Roles    : {json.dumps(k.get('user_roles', []))}
+Core Workflows: {json.dumps(k.get('core_workflows', []))}
+Business Rules: {json.dumps(k.get('business_rules', []))}
+Test Priorities: {json.dumps(k.get('test_priorities', []))}
+
+=== DISCOVERED PAGES ===
+{json.dumps(pages_summary, indent=2)}
+
+=== BASE URL ===
+{self.base_url}
+
+{skills_context}
+
+=== TASK ===
+Generate a comprehensive set of test scenarios grouped by module.
+For EACH core workflow and EACH user role, create at least one scenario.
+Cover: happy paths, error paths, edge cases, security checks, role-based access.
+
+Return ONLY valid JSON in this exact structure:
+{{
+  "base_url": "{self.base_url}",
+  "total_scenarios": <number>,
+  "modules": {{
+    "<module_name>": {{
+      "name": "<display name>",
+      "requires_auth": <true|false>,
+      "scenarios": [
+        {{
+          "id": "<module_prefix>_<NNN>",
+          "name": "<scenario name>",
+          "description": "<what is being tested and why>",
+          "module": "<module_name>",
+          "type": "happy_path|error_path|edge_case|security",
+          "priority": "high|medium|low",
+          "depends_on": null,
+          "user_role": "<role name or null>",
+          "business_rule": "<which rule this validates or null>",
+          "steps": [
+            {{
+              "action": "navigate|fill|click|assert|wait",
+              "target": "<CSS selector or URL or assertion type>",
+              "value": "<fill value or null>",
+              "description": "<plain English description of this step>"
+            }}
+          ],
+          "status": "pending"
+        }}
+      ]
+    }}
+  }}
+}}
+
+IMPORTANT:
+- Use real CSS selectors from the discovered forms where available
+- For each user role, test what they CAN do and what they CANNOT do
+- Include at least one security test per auth-related module
+- Use actual page URLs from the discovered pages
+- Be specific to this domain: {k.get('domain', 'web-application')}"""
+
+        response = self.llm.model.invoke(prompt)
+        content = getattr(response, "content", str(response)).strip()
+
+        # Strip markdown fences
+        if content.startswith("```"):
+            lines = content.split("\n")
+            content = "\n".join(lines[1:])
+            if content.rstrip().endswith("```"):
+                content = content.rstrip()[:-3].strip()
+
+        plan = json.loads(content)
+
+        # Ensure total_scenarios is accurate
+        total = sum(
+            len(m.get("scenarios", []))
+            for m in plan.get("modules", {}).values()
+        )
+        plan["total_scenarios"] = total
+        return plan
 
 
 if __name__ == "__main__":

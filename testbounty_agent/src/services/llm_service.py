@@ -28,15 +28,20 @@ class LLMService:
         print(f"ANTHROPIC_KEY: {'Yes' if os.getenv('ANTHROPIC_API_KEY') else 'No'}")
         print(f"GOOGLE_KEY: {'Yes' if os.getenv('GOOGLE_API_KEY') else 'No'}")
 
-        # Check for API keys
+        # Check for API keys — prefer models that support prompt caching
         if os.getenv("OPENAI_API_KEY"):
             print("Selecting Provider: OpenAI")
             self.provider = "openai"
             self.model = ChatOpenAI(model="gpt-4-turbo-preview", temperature=0.7)
         elif os.getenv("ANTHROPIC_API_KEY"):
-            print("Selecting Provider: Anthropic")
+            print("Selecting Provider: Anthropic (prompt caching enabled)")
             self.provider = "anthropic"
-            self.model = ChatAnthropic(model="claude-3-opus-20240229", temperature=0.7)
+            # claude-3-5-haiku supports prompt caching — cheapest + fast
+            self.model = ChatAnthropic(
+                model="claude-3-5-haiku-20241022",
+                temperature=0.7,
+                extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+            )
         elif os.getenv("GOOGLE_API_KEY"):
             if ChatGoogleGenerativeAI:
                 print("Selecting Provider: Google Gemini")
@@ -48,6 +53,21 @@ class LLMService:
         else:
             print("WARNING: No Keys found. Defaulting to Mock.")
             logger.warning("No API keys found. Using Mock LLM.")
+
+    @staticmethod
+    def mask_sensitive(text: str) -> str:
+        """
+        Responsible AI: mask passwords and secrets before sending to LLM.
+        Prevents real credentials leaking into external API calls.
+        """
+        import re
+        # Mask password-like values in JSON
+        text = re.sub(r'("password"\s*:\s*")[^"]+(")', r'\1[MASKED]\2', text, flags=re.IGNORECASE)
+        text = re.sub(r'("secret"\s*:\s*")[^"]+(")', r'\1[MASKED]\2', text, flags=re.IGNORECASE)
+        text = re.sub(r'("token"\s*:\s*")[^"]+(")', r'\1[MASKED]\2', text, flags=re.IGNORECASE)
+        # Mask common password patterns in plain text
+        text = re.sub(r'\bpassword[:\s=]+\S+', 'password: [MASKED]', text, flags=re.IGNORECASE)
+        return text
 
     def generate_prd(self, context: str) -> Dict[str, Any]:
         """

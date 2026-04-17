@@ -285,11 +285,29 @@ export interface TestPlan {
     error?: string;
 }
 
-export async function exploreUrl(url: string, maxPages: number = 30): Promise<{ explore_id: string; status: string }> {
+export interface UserRoleKT {
+    role: string;
+    email?: string;
+    password?: string;
+    description?: string;
+}
+
+export async function exploreUrl(
+    url: string,
+    maxPages: number = 30,
+    appDescription?: string,
+    userRoles?: UserRoleKT[],
+    keyJourneys?: string[],
+): Promise<{ explore_id: string; status: string }> {
+    const body: Record<string, unknown> = { url, max_pages: maxPages };
+    if (appDescription) body.app_description = appDescription;
+    if (userRoles && userRoles.length > 0) body.user_roles = userRoles;
+    if (keyJourneys && keyJourneys.length > 0) body.key_journeys = keyJourneys;
+
     const res = await fetch(`${API_BASE}/explore`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, max_pages: maxPages }),
+        body: JSON.stringify(body),
     });
     if (!res.ok) throw new Error('Failed to start exploration');
     return res.json();
@@ -312,6 +330,14 @@ export async function deletePlan(planId: string): Promise<{ status: string; plan
         method: 'DELETE',
     });
     if (!res.ok) throw new Error('Failed to delete plan');
+    return res.json();
+}
+
+export async function cancelPlan(planId: string): Promise<{ status: string; plan_id: string }> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/cancel`, {
+        method: 'POST',
+    });
+    if (!res.ok) throw new Error('Failed to cancel plan');
     return res.json();
 }
 
@@ -354,7 +380,7 @@ export function getScenarioVideoFileUrl(runId: string, filename: string): string
 }
 
 export async function listScenarioVideos(runId: string): Promise<{
-    videos: { filename: string; url: string; size: number }[];
+    videos: { filename: string; scenario_id?: string; url: string; size: number }[];
 }> {
     const res = await fetch(`${API_BASE}/scenario-run/${runId}/videos`);
     if (!res.ok) throw new Error('Failed to list videos');
@@ -378,6 +404,138 @@ export async function getAllScenarioCode(runId: string): Promise<{
 }> {
     const res = await fetch(`${API_BASE}/scenario-run/${runId}/code`);
     if (!res.ok) throw new Error('Failed to get all scenario code');
+    return res.json();
+}
+
+// =============================================
+// KT MODE 1 — USER STORY IMPORT
+// =============================================
+
+export async function importStories(
+    planId: string,
+    stories: string,
+    format: 'plain' | 'gherkin' | 'jira' = 'plain'
+): Promise<{ status: string; scenarios_added: number; total_scenarios: number; modules_added: string[] }> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/import-stories`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ stories, format }),
+    });
+    if (!res.ok) throw new Error('Failed to import stories');
+    return res.json();
+}
+
+// =============================================
+// KT MODE 2 — DOCUMENT UPLOAD
+// =============================================
+
+export async function importDocument(
+    planId: string,
+    file: File
+): Promise<{ status: string; filename: string; extracted_chars: number; scenarios_added: number; total_scenarios: number }> {
+    const form = new FormData();
+    form.append('file', file);
+    const res = await fetch(`${API_BASE}/plans/${planId}/import-doc`, {
+        method: 'POST',
+        body: form,
+    });
+    if (!res.ok) throw new Error('Failed to import document');
+    return res.json();
+}
+
+// =============================================
+// KT MODE 3 — AI-GUIDED CHAT
+// =============================================
+
+export interface ChatMessage {
+    role: 'user' | 'assistant';
+    content: string;
+    timestamp: string;
+}
+
+export interface ChatReply {
+    reply: string;
+    next_question: string | null;
+    knowledge_updated: boolean;
+    suggestions: string[];
+    turn: number;
+}
+
+export async function sendChatMessage(planId: string, message: string): Promise<ChatReply> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message }),
+    });
+    if (!res.ok) throw new Error('Failed to send chat message');
+    return res.json();
+}
+
+export async function getChatHistory(planId: string): Promise<{ history: ChatMessage[]; opening: ChatReply | null }> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/chat`);
+    if (!res.ok) throw new Error('Failed to get chat history');
+    return res.json();
+}
+
+export async function applyChatKnowledge(planId: string): Promise<{ status: string; total_scenarios: number }> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/chat/apply`, { method: 'POST' });
+    if (!res.ok) throw new Error('Failed to apply chat knowledge');
+    return res.json();
+}
+
+// =============================================
+// KT MODE 4 — SESSION RECORDING
+// =============================================
+
+export interface SessionRecord {
+    id: string;
+    status: 'starting' | 'recording' | 'stopping' | 'analysing' | 'ready' | 'error';
+    events_count: number;
+    url: string;
+    created_at: string;
+    stopped_at: string | null;
+    error: string | null;
+}
+
+export async function startSessionRecord(url: string, planId?: string): Promise<{ session_id: string; status: string; url: string }> {
+    const res = await fetch(`${API_BASE}/session-record/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, plan_id: planId }),
+    });
+    if (!res.ok) throw new Error('Failed to start recording');
+    return res.json();
+}
+
+export async function getSessionRecord(sessionId: string): Promise<SessionRecord> {
+    const res = await fetch(`${API_BASE}/session-record/${sessionId}`);
+    if (!res.ok) throw new Error('Session not found');
+    return res.json();
+}
+
+export async function stopSessionRecord(sessionId: string): Promise<{ session_id: string; events_count: number; status: string }> {
+    const res = await fetch(`${API_BASE}/session-record/${sessionId}/stop`, { method: 'POST' });
+    if (!res.ok) throw new Error('Failed to stop recording');
+    return res.json();
+}
+
+// Skills
+export interface SkillInfo {
+    file: string;
+    name: string;
+    domain: string;
+    keyword_count: number;
+}
+
+export async function listSkills(): Promise<{ skills: SkillInfo[] }> {
+    const res = await fetch(`${API_BASE}/skills`);
+    if (!res.ok) throw new Error('Failed to fetch skills');
+    return res.json();
+}
+
+export async function getActiveSkills(planId: string): Promise<{ plan_id: string; domain: string; active_skills: string[] }> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/active-skills`);
+    if (!res.ok) throw new Error('Failed to fetch active skills');
     return res.json();
 }
 
@@ -412,11 +570,26 @@ export const api = {
     deleteMonitor,
     runMonitorNow,
 
-    // Explorer & Planner
+    // Explorer & Planner (Knowledge-aware)
     exploreUrl,
     getPlans,
     getPlan,
     deletePlan,
+    cancelPlan,
     runScenarios,
     runModule,
+
+    // KT Modes
+    importStories,
+    importDocument,
+    sendChatMessage,
+    getChatHistory,
+    applyChatKnowledge,
+    startSessionRecord,
+    getSessionRecord,
+    stopSessionRecord,
+
+    // Skills
+    listSkills,
+    getActiveSkills,
 };

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
@@ -15,6 +15,7 @@ load_dotenv()
 from src.agents.orchestrator import app as agent_app
 from src.agents.explorer import explore_application
 from src.agents.planner import generate_test_plan
+from src.agents.knowledge_builder import build_app_knowledge
 from src.utils.logger import logger
 
 app = FastAPI(title="TestBounty Agent API")
@@ -757,14 +758,27 @@ def save_plans(plans):
 PLANS = load_plans()
 
 
+class UserRole(BaseModel):
+    role: str
+    email: Optional[str] = None
+    password: Optional[str] = None
+    description: Optional[str] = None
+
+
 class ExploreRequest(BaseModel):
     url: str
     max_pages: int = 30
+    # Knowledge Transfer fields — give the AI context about the app
+    app_description: Optional[str] = None          # "A B2B SaaS for project management"
+    user_roles: Optional[List[UserRole]] = None    # [{"role":"admin","email":"...","password":"..."}]
+    key_journeys: Optional[List[str]] = None       # ["User registers → creates project → invites team"]
 
 
 class RunScenariosRequest(BaseModel):
     scenario_ids: List[str] = []  # Empty = run all
     module: Optional[str] = None  # Run all scenarios in a module
+    browser: Optional[str] = "chromium"  # Browser to use: chromium, firefox, webkit
+    test_credentials: Optional[TestCredentials] = None  # Override credentials for login tests
 
 
 @app.post("/api/explore")
@@ -775,14 +789,32 @@ async def explore_url(request: ExploreRequest):
     """
     explore_id = str(uuid.uuid4())
 
+    # Normalise user_roles to plain dicts for JSON storage
+    user_roles_data = []
+    if request.user_roles:
+        for r in request.user_roles:
+            user_roles_data.append({
+                "role": r.role,
+                "email": r.email,
+                "password": r.password,
+                "description": r.description or "",
+            })
+
     PLANS[explore_id] = {
         "id": explore_id,
         "url": request.url,
         "status": "exploring",
         "created_at": datetime.now().isoformat(),
         "app_map": None,
+        "app_knowledge": None,
         "test_plan": None,
-        "error": None
+        "error": None,
+        # Store KT context provided by user
+        "kt_context": {
+            "app_description": request.app_description or "",
+            "user_roles": user_roles_data,
+            "key_journeys": request.key_journeys or [],
+        },
     }
     save_plans(PLANS)
 
@@ -791,41 +823,96 @@ async def explore_url(request: ExploreRequest):
         run_exploration_task(
             explore_id,
             request.url,
-            request.max_pages
+            request.max_pages,
+            request.app_description or "",
+            user_roles_data,
+            request.key_journeys or [],
         )
     )
 
     return {"explore_id": explore_id, "status": "exploring"}
 
 
-async def run_exploration_task(explore_id: str, url: str, max_pages: int):
-    """Background task to explore and generate test plan."""
-    try:
-        logger.info(f"Starting exploration of {url}")
+async def run_exploration_task(
+    explore_id: str,
+    url: str,
+    max_pages: int,
+    app_description: str = "",
+    user_roles: List[Dict] = None,
+    key_journeys: List[str] = None,
+):
+    """Background task: explore → build knowledge → generate test plan."""
+    from src.services.llm_service import LLMService
 
-        # Step 1: Explore the application
+    EXPLORE_TIMEOUT = 180  # 3 minutes max for exploration
+
+    try:
+        llm = LLMService()
+
+        # ── Step 1: Explore the application ──────────────────────────
+        logger.info(f"[{explore_id}] Starting exploration of {url}")
         PLANS[explore_id]["status"] = "exploring"
         save_plans(PLANS)
 
-        app_map = await explore_application(url, max_pages)
+        try:
+            app_map = await asyncio.wait_for(
+                explore_application(url, max_pages),
+                timeout=EXPLORE_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"[{explore_id}] Exploration timed out after {EXPLORE_TIMEOUT}s — using partial results")
+            # Build a minimal app_map from whatever the explorer discovered
+            from src.agents.explorer import ExplorerAgent
+            # Exploration timed out but we still proceed with empty map
+            app_map = {"base_url": url, "total_pages": 0, "pages": [], "modules": {}, "auth_pages": []}
         PLANS[explore_id]["app_map"] = app_map
+        save_plans(PLANS)
 
-        # Step 2: Generate test scenarios
+        # ── Step 2: Build AppKnowledge (cache-aware) ─────────────────
+        logger.info(f"[{explore_id}] Building application knowledge")
+        PLANS[explore_id]["status"] = "understanding"
+        save_plans(PLANS)
+
+        app_knowledge = await build_app_knowledge(
+            base_url=url,
+            app_map=app_map,
+            llm_service=llm,
+            user_description=app_description,
+            user_roles=user_roles or [],
+            key_journeys=key_journeys or [],
+        )
+        PLANS[explore_id]["app_knowledge"] = app_knowledge
+        PLANS[explore_id]["knowledge_from_cache"] = bool(app_knowledge.get("_from_cache"))
+        save_plans(PLANS)
+        cache_note = " (from cache — no LLM cost)" if app_knowledge.get("_from_cache") else ""
+        logger.info(
+            f"[{explore_id}] Knowledge built{cache_note} — domain: {app_knowledge.get('domain')}, "
+            f"confidence: {app_knowledge.get('confidence')}"
+        )
+
+        # ── Step 3: Generate test scenarios ──────────────────────────
+        logger.info(f"[{explore_id}] Generating test plan")
         PLANS[explore_id]["status"] = "planning"
         save_plans(PLANS)
 
-        test_plan = generate_test_plan(app_map)
+        test_plan = generate_test_plan(
+            app_map=app_map,
+            app_knowledge=app_knowledge,
+            llm_service=llm,
+        )
         PLANS[explore_id]["test_plan"] = test_plan
 
-        # Done
+        # ── Done ──────────────────────────────────────────────────────
         PLANS[explore_id]["status"] = "ready"
         PLANS[explore_id]["completed_at"] = datetime.now().isoformat()
         save_plans(PLANS)
 
-        logger.info(f"Exploration complete for {url}: {test_plan['total_scenarios']} scenarios generated")
+        logger.info(
+            f"[{explore_id}] Complete — {test_plan['total_scenarios']} scenarios generated"
+        )
 
     except Exception as e:
-        logger.error(f"Exploration failed for {url}: {e}")
+        logger.error(f"[{explore_id}] Exploration failed: {e}")
         PLANS[explore_id]["status"] = "failed"
         PLANS[explore_id]["error"] = str(e)
         save_plans(PLANS)
@@ -855,6 +942,22 @@ async def delete_plan(plan_id: str):
     save_plans(PLANS)
 
     return {"status": "deleted", "plan_id": plan_id}
+
+
+@app.post("/api/plans/{plan_id}/cancel")
+async def cancel_plan(plan_id: str):
+    """Cancel an in-progress exploration."""
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    plan = PLANS[plan_id]
+    if plan["status"] in ("exploring", "understanding", "planning"):
+        PLANS[plan_id]["status"] = "failed"
+        PLANS[plan_id]["error"] = "Cancelled by user"
+        save_plans(PLANS)
+        return {"status": "cancelled", "plan_id": plan_id}
+
+    return {"status": plan["status"], "plan_id": plan_id}
 
 
 @app.post("/api/plans/{plan_id}/run")
@@ -901,6 +1004,14 @@ async def run_plan_scenarios(plan_id: str, request: RunScenariosRequest, backgro
     # Create a run for these scenarios
     run_id = str(uuid.uuid4())
 
+    # Convert test credentials to dict if provided
+    credentials = None
+    if request.test_credentials:
+        credentials = {
+            "username": request.test_credentials.username,
+            "password": request.test_credentials.password
+        }
+
     RUNS[run_id] = {
         "id": run_id,
         "plan_id": plan_id,
@@ -908,6 +1019,7 @@ async def run_plan_scenarios(plan_id: str, request: RunScenariosRequest, backgro
         "target_url": plan["url"],
         "test_name": f"Scenario Run - {len(scenarios_to_run)} tests",
         "scenarios": scenarios_to_run,
+        "test_credentials": credentials,
         "status": "pending",
         "results": {},
         "created_at": datetime.now().isoformat()
@@ -919,7 +1031,9 @@ async def run_plan_scenarios(plan_id: str, request: RunScenariosRequest, backgro
         run_scenarios_task,
         run_id,
         plan["url"],
-        scenarios_to_run
+        scenarios_to_run,
+        request.browser or "chromium",
+        credentials
     )
 
     return {
@@ -929,18 +1043,64 @@ async def run_plan_scenarios(plan_id: str, request: RunScenariosRequest, backgro
     }
 
 
-async def run_scenarios_task(run_id: str, base_url: str, scenarios: List[Dict]):
+def apply_credentials_to_scenarios(scenarios: List[Dict], credentials: Dict) -> List[Dict]:
+    """
+    Replace placeholder credentials in scenarios with real credentials.
+    This allows users to provide actual login credentials to override generated test data.
+    """
+    import copy
+
+    # Common placeholder patterns to replace
+    placeholder_emails = [
+        "testuser@example.com", "user@example.com", "test@test.com",
+        "admin@example.com", "demo@demo.com"
+    ]
+    placeholder_passwords = [
+        "TestPassword123!", "password123", "Password123!",
+        "test123", "admin123"
+    ]
+
+    updated_scenarios = copy.deepcopy(scenarios)
+
+    for scenario in updated_scenarios:
+        # Only apply to login-related scenarios
+        scenario_name = scenario.get("name", "").lower()
+        if "login" in scenario_name or "sign in" in scenario_name or "auth" in scenario_name:
+            for step in scenario.get("steps", []):
+                if step.get("action") == "fill":
+                    # Check if this is an email/username field
+                    target = step.get("target", "").lower()
+                    value = step.get("value", "")
+
+                    # Replace placeholder email with real username
+                    if any(field in target for field in ["email", "username", "user", "login"]):
+                        if value in placeholder_emails:
+                            step["value"] = credentials.get("username", value)
+
+                    # Replace placeholder password with real password
+                    if "password" in target:
+                        if value in placeholder_passwords:
+                            step["value"] = credentials.get("password", value)
+
+    return updated_scenarios
+
+
+async def run_scenarios_task(run_id: str, base_url: str, scenarios: List[Dict], browser_type: str = "chromium", credentials: Dict = None):
     """Background task to execute test scenarios."""
     import platform
     from concurrent.futures import ThreadPoolExecutor
 
-    logger.info(f"Starting scenario run {run_id} with {len(scenarios)} scenarios")
+    logger.info(f"Starting scenario run {run_id} with {len(scenarios)} scenarios on {browser_type}")
+
+    # Apply real credentials if provided
+    if credentials:
+        scenarios = apply_credentials_to_scenarios(scenarios, credentials)
 
     # On Windows, use sync version in thread pool to avoid NotImplementedError
     if platform.system() == 'Windows':
         loop = asyncio.get_event_loop()
         with ThreadPoolExecutor() as executor:
-            await loop.run_in_executor(executor, run_scenarios_task_sync, run_id, base_url, scenarios)
+            await loop.run_in_executor(executor, run_scenarios_task_sync, run_id, base_url, scenarios, browser_type)
         return
 
     from playwright.async_api import async_playwright
@@ -952,11 +1112,13 @@ async def run_scenarios_task(run_id: str, base_url: str, scenarios: List[Dict]):
 
     try:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                viewport={'width': 1280, 'height': 720},
-                record_video_dir=f"./temp_runs/{run_id}/videos"
-            )
+            # Select browser based on browser_type parameter
+            if browser_type == "firefox":
+                browser = await p.firefox.launch(headless=True)
+            elif browser_type == "webkit":
+                browser = await p.webkit.launch(headless=True)
+            else:  # Default to chromium
+                browser = await p.chromium.launch(headless=True)
 
             # Check if we need to login first
             auth_scenario = None
@@ -969,18 +1131,28 @@ async def run_scenarios_task(run_id: str, base_url: str, scenarios: List[Dict]):
                     )
                     break
 
-            # Run auth scenario first if needed
+            # Run auth scenario first if needed (separate context for video)
             if auth_scenario:
+                context = await browser.new_context(
+                    viewport={'width': 1280, 'height': 720},
+                    record_video_dir=f"./temp_runs/{run_id}/videos/{auth_scenario['id']}"
+                )
                 page = await context.new_page()
                 result = await execute_scenario(page, auth_scenario, base_url)
                 results[auth_scenario["id"]] = result
-                # Keep page open for subsequent tests that need auth
+                await page.close()
+                await context.close()
 
-            # Run each scenario
+            # Run each scenario in its own context for separate video recording
             for scenario in scenarios:
                 if scenario.get("id") == (auth_scenario["id"] if auth_scenario else None):
                     continue  # Already ran auth
 
+                # Create new context for each scenario to get separate video
+                context = await browser.new_context(
+                    viewport={'width': 1280, 'height': 720},
+                    record_video_dir=f"./temp_runs/{run_id}/videos/{scenario['id']}"
+                )
                 page = await context.new_page()
 
                 try:
@@ -999,6 +1171,7 @@ async def run_scenarios_task(run_id: str, base_url: str, scenarios: List[Dict]):
 
                 finally:
                     await page.close()
+                    await context.close()
 
             await browser.close()
 
@@ -1014,22 +1187,33 @@ async def run_scenarios_task(run_id: str, base_url: str, scenarios: List[Dict]):
     save_runs()
 
 
-def run_scenarios_task_sync(run_id: str, base_url: str, scenarios: List[Dict]):
+def run_scenarios_task_sync(run_id: str, base_url: str, scenarios: List[Dict], browser_type: str = "chromium", credentials: Dict = None):
     """Synchronous version for Windows - Background task to execute test scenarios."""
     from playwright.sync_api import sync_playwright
+    from src.agents.self_healer import create_self_healer
+    from src.services.llm_service import LLMService
 
     RUNS[run_id]["status"] = "running"
     save_runs()
 
     results = {}
+    # Initialise self-healer for this run
+    llm = LLMService()
+    healer = create_self_healer(llm)
+
+    # Apply credentials if provided
+    if credentials:
+        scenarios = apply_credentials_to_scenarios(scenarios, credentials)
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                viewport={'width': 1280, 'height': 720},
-                record_video_dir=f"./temp_runs/{run_id}/videos"
-            )
+            # Select browser based on browser_type parameter
+            if browser_type == "firefox":
+                browser = p.firefox.launch(headless=True)
+            elif browser_type == "webkit":
+                browser = p.webkit.launch(headless=True)
+            else:  # Default to chromium
+                browser = p.chromium.launch(headless=True)
 
             # Check if we need to login first
             auth_scenario = None
@@ -1042,22 +1226,32 @@ def run_scenarios_task_sync(run_id: str, base_url: str, scenarios: List[Dict]):
                     )
                     break
 
-            # Run auth scenario first if needed
+            # Run auth scenario first if needed (separate context for video)
             if auth_scenario:
+                context = browser.new_context(
+                    viewport={'width': 1280, 'height': 720},
+                    record_video_dir=f"./temp_runs/{run_id}/videos/{auth_scenario['id']}"
+                )
                 page = context.new_page()
-                result = execute_scenario_sync(page, auth_scenario, base_url)
+                result = execute_scenario_sync(page, auth_scenario, base_url, healer)
                 results[auth_scenario["id"]] = result
-                # Keep page open for subsequent tests that need auth
+                page.close()
+                context.close()
 
-            # Run each scenario
+            # Run each scenario in its own context for separate video recording
             for scenario in scenarios:
                 if scenario.get("id") == (auth_scenario["id"] if auth_scenario else None):
                     continue  # Already ran auth
 
+                # Create new context for each scenario to get separate video
+                context = browser.new_context(
+                    viewport={'width': 1280, 'height': 720},
+                    record_video_dir=f"./temp_runs/{run_id}/videos/{scenario['id']}"
+                )
                 page = context.new_page()
 
                 try:
-                    result = execute_scenario_sync(page, scenario, base_url)
+                    result = execute_scenario_sync(page, scenario, base_url, healer)
                     results[scenario["id"]] = result
 
                     # Update progress
@@ -1072,12 +1266,14 @@ def run_scenarios_task_sync(run_id: str, base_url: str, scenarios: List[Dict]):
 
                 finally:
                     page.close()
+                    context.close()
 
             browser.close()
 
         RUNS[run_id]["status"] = "completed"
         RUNS[run_id]["results"] = results
         RUNS[run_id]["completed_at"] = datetime.now().isoformat()
+        RUNS[run_id]["heal_summary"] = healer.get_heal_summary()
 
     except Exception as e:
         logger.error(f"Scenario run {run_id} failed: {e}")
@@ -1087,7 +1283,7 @@ def run_scenarios_task_sync(run_id: str, base_url: str, scenarios: List[Dict]):
     save_runs()
 
 
-def execute_scenario_sync(page, scenario: Dict, base_url: str) -> Dict:
+def execute_scenario_sync(page, scenario: Dict, base_url: str, healer=None) -> Dict:
     """Synchronous version for Windows - Execute a single test scenario and return results."""
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
@@ -1123,7 +1319,24 @@ def execute_scenario_sync(page, scenario: Dict, base_url: str) -> Dict:
                     except:
                         continue
                 if not filled:
-                    raise Exception(f"Could not find element: {target}")
+                    # Try self-healing before giving up
+                    if healer:
+                        html = page.content()
+                        healed_step = healer.heal_selector(step, html, page.url)
+                        if healed_step:
+                            new_selectors = healed_step["target"].split(", ")
+                            for sel in new_selectors:
+                                try:
+                                    elem = page.wait_for_selector(sel.strip(), timeout=3000)
+                                    if elem:
+                                        elem.fill(value or "")
+                                        filled = True
+                                        step["target"] = healed_step["target"]
+                                        break
+                                except:
+                                    continue
+                    if not filled:
+                        raise Exception(f"Could not find element: {target}")
 
             elif action == "click":
                 selectors = target.split(", ")
@@ -1138,7 +1351,24 @@ def execute_scenario_sync(page, scenario: Dict, base_url: str) -> Dict:
                     except:
                         continue
                 if not clicked:
-                    raise Exception(f"Could not click element: {target}")
+                    # Try self-healing before giving up
+                    if healer:
+                        html = page.content()
+                        healed_step = healer.heal_selector(step, html, page.url)
+                        if healed_step:
+                            new_selectors = healed_step["target"].split(", ")
+                            for sel in new_selectors:
+                                try:
+                                    elem = page.wait_for_selector(sel.strip(), timeout=3000)
+                                    if elem:
+                                        elem.click()
+                                        clicked = True
+                                        step["target"] = healed_step["target"]
+                                        break
+                                except:
+                                    continue
+                    if not clicked:
+                        raise Exception(f"Could not click element: {target}")
 
             elif action == "wait":
                 if target == "navigation":
@@ -1151,10 +1381,35 @@ def execute_scenario_sync(page, scenario: Dict, base_url: str) -> Dict:
                 if target == "page_loaded":
                     assert page.title(), "Page did not load"
                 elif target == "url_changed":
-                    pass  # URL assertion handled implicitly
+                    # Check if login actually succeeded by looking for account indicators
+                    current_url = page.url
+                    success_indicators = [
+                        ".account", ".header-links a[href*='logout']",
+                        ".header-links a[href*='account']", "[href*='customerinfo']",
+                        "a:has-text('Log out')", "a:has-text('Logout')",
+                        ".ico-logout", "[href*='logout']"
+                    ]
+                    found_success = False
+                    for sel in success_indicators:
+                        try:
+                            elem = page.query_selector(sel)
+                            if elem and elem.is_visible():
+                                found_success = True
+                                break
+                        except:
+                            continue
+                    # If still on login page and no success indicators, fail
+                    if 'login' in current_url.lower() and not found_success:
+                        assert False, "Login failed - still on login page"
+                    assert found_success, "Login success indicators not found"
                 elif target == "error_message_visible":
-                    # Look for common error indicators
-                    error_selectors = [".error", ".alert-danger", "[role='alert']", ".text-red", ".text-danger"]
+                    # Look for common error indicators including ASP.NET MVC validation
+                    error_selectors = [
+                        ".validation-summary-errors", ".field-validation-error",
+                        ".error", ".alert-danger", "[role='alert']",
+                        ".text-red", ".text-danger", ".message-error",
+                        ".validation-summary-errors li", ".validation-summary-errors ul"
+                    ]
                     found = False
                     for sel in error_selectors:
                         try:
@@ -1253,10 +1508,35 @@ async def execute_scenario(page, scenario: Dict, base_url: str) -> Dict:
                 if target == "page_loaded":
                     assert await page.title(), "Page did not load"
                 elif target == "url_changed":
-                    pass  # URL assertion handled implicitly
+                    # Check if login actually succeeded by looking for account indicators
+                    current_url = page.url
+                    success_indicators = [
+                        ".account", ".header-links a[href*='logout']",
+                        ".header-links a[href*='account']", "[href*='customerinfo']",
+                        "a:has-text('Log out')", "a:has-text('Logout')",
+                        ".ico-logout", "[href*='logout']"
+                    ]
+                    found_success = False
+                    for sel in success_indicators:
+                        try:
+                            elem = await page.query_selector(sel)
+                            if elem and await elem.is_visible():
+                                found_success = True
+                                break
+                        except:
+                            continue
+                    # If still on login page and no success indicators, fail
+                    if 'login' in current_url.lower() and not found_success:
+                        assert False, "Login failed - still on login page"
+                    assert found_success, "Login success indicators not found"
                 elif target == "error_message_visible":
-                    # Look for common error indicators
-                    error_selectors = [".error", ".alert-danger", "[role='alert']", ".text-red", ".text-danger"]
+                    # Look for common error indicators including ASP.NET MVC validation
+                    error_selectors = [
+                        ".validation-summary-errors", ".field-validation-error",
+                        ".error", ".alert-danger", "[role='alert']",
+                        ".text-red", ".text-danger", ".message-error",
+                        ".validation-summary-errors li", ".validation-summary-errors ul"
+                    ]
                     found = False
                     for sel in error_selectors:
                         try:
@@ -1266,7 +1546,7 @@ async def execute_scenario(page, scenario: Dict, base_url: str) -> Dict:
                                 break
                         except:
                             continue
-                    # Don't fail if error not found - might be handled differently
+                    assert found, "Expected error message not found"
 
             scenario_result["steps_completed"].append(step["description"])
 
@@ -1321,20 +1601,22 @@ async def get_scenario_video(run_id: str, scenario_id: str):
     if run_id not in RUNS:
         raise HTTPException(status_code=404, detail="Run not found")
 
+    # Check new structure first (videos/{scenario_id}/*.webm)
+    scenario_video_dir = Path(f"./temp_runs/{run_id}/videos/{scenario_id}")
+
+    if scenario_video_dir.exists():
+        webm_files = list(scenario_video_dir.glob("*.webm"))
+        if webm_files:
+            return FileResponse(webm_files[0], media_type="video/webm")
+
+    # Fallback to old structure (videos/*.webm)
     video_dir = Path(f"./temp_runs/{run_id}/videos")
+    if video_dir.exists():
+        webm_files = list(video_dir.glob("*.webm"))
+        if webm_files:
+            return FileResponse(webm_files[0], media_type="video/webm")
 
-    if not video_dir.exists():
-        raise HTTPException(status_code=404, detail="No videos found for this run")
-
-    # Find video file for this scenario (videos are named by page context)
-    webm_files = list(video_dir.glob("*.webm"))
-
-    if not webm_files:
-        raise HTTPException(status_code=404, detail="No video files found")
-
-    # Return the first video for now (or match by index if multiple)
-    # In future, can map scenario_id to specific video
-    return FileResponse(webm_files[0], media_type="video/webm")
+    raise HTTPException(status_code=404, detail=f"No video found for scenario {scenario_id}")
 
 
 @app.get("/api/scenario-run/{run_id}/videos")
@@ -1348,18 +1630,29 @@ async def list_scenario_videos(run_id: str):
     if not video_dir.exists():
         return {"videos": []}
 
-    webm_files = list(video_dir.glob("*.webm"))
+    videos = []
 
-    return {
-        "videos": [
-            {
-                "filename": f.name,
-                "url": f"/api/scenario-run/{run_id}/video-file/{f.name}",
-                "size": f.stat().st_size
-            }
-            for f in webm_files
-        ]
-    }
+    # Check for new structure (videos/{scenario_id}/*.webm)
+    for scenario_dir in video_dir.iterdir():
+        if scenario_dir.is_dir():
+            for webm_file in scenario_dir.glob("*.webm"):
+                videos.append({
+                    "filename": webm_file.name,
+                    "scenario_id": scenario_dir.name,
+                    "url": f"/api/scenario-run/{run_id}/video-file/{webm_file.name}",
+                    "size": webm_file.stat().st_size
+                })
+
+    # Also check for old structure (videos/*.webm)
+    for webm_file in video_dir.glob("*.webm"):
+        videos.append({
+            "filename": webm_file.name,
+            "scenario_id": None,
+            "url": f"/api/scenario-run/{run_id}/video-file/{webm_file.name}",
+            "size": webm_file.stat().st_size
+        })
+
+    return {"videos": videos}
 
 
 @app.get("/api/scenario-run/{run_id}/video-file/{filename}")
@@ -1368,12 +1661,22 @@ async def get_scenario_video_file(run_id: str, filename: str):
     if run_id not in RUNS:
         raise HTTPException(status_code=404, detail="Run not found")
 
-    video_path = Path(f"./temp_runs/{run_id}/videos/{filename}")
+    # Search for the video file in scenario subdirectories
+    video_dir = Path(f"./temp_runs/{run_id}/videos")
 
-    if not video_path.exists():
-        raise HTTPException(status_code=404, detail="Video file not found")
+    # First check flat structure (old format)
+    video_path = video_dir / filename
+    if video_path.exists():
+        return FileResponse(video_path, media_type="video/webm")
 
-    return FileResponse(video_path, media_type="video/webm")
+    # Then search in scenario subdirectories (new format)
+    for scenario_dir in video_dir.iterdir():
+        if scenario_dir.is_dir():
+            video_path = scenario_dir / filename
+            if video_path.exists():
+                return FileResponse(video_path, media_type="video/webm")
+
+    raise HTTPException(status_code=404, detail="Video file not found")
 
 
 @app.get("/api/scenario-run/{run_id}/code/{scenario_id}")
@@ -1576,6 +1879,400 @@ async def analyze_latest():
         return analysis
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# KT MODE 1 — USER STORY IMPORT
+# =============================================================================
+
+class ImportStoriesRequest(BaseModel):
+    stories: str
+    format: Optional[str] = "plain"  # plain | gherkin | jira
+
+
+@app.post("/api/plans/{plan_id}/import-stories")
+async def import_stories(plan_id: str, request: ImportStoriesRequest):
+    """
+    Parse user stories / acceptance criteria and merge into existing plan scenarios.
+    Returns the enriched plan.
+    """
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    plan = PLANS[plan_id]
+    base_url = plan.get("url", "/")
+
+    try:
+        from src.services.llm_service import LLMService
+        from src.agents.story_parser import parse_user_stories
+
+        llm = LLMService()
+        result = parse_user_stories(request.stories, base_url=base_url, llm_service=llm)
+
+        # Merge into existing test_plan
+        existing_plan = plan.get("test_plan") or {"base_url": base_url, "total_scenarios": 0, "modules": {}}
+        merged = _merge_scenario_modules(existing_plan, result)
+        PLANS[plan_id]["test_plan"] = merged
+        PLANS[plan_id]["status"] = "ready"
+
+        # Track KT sources
+        kt_sources = PLANS[plan_id].setdefault("kt_sources", [])
+        kt_sources.append({"type": "user_stories", "added_at": datetime.now().isoformat(), "scenarios_added": result.get("total_scenarios", 0)})
+
+        save_plans(PLANS)
+
+        return {
+            "status": "ok",
+            "scenarios_added": result.get("total_scenarios", 0),
+            "total_scenarios": merged.get("total_scenarios", 0),
+            "modules_added": list(result.get("modules", {}).keys()),
+        }
+    except Exception as e:
+        logger.error(f"[import-stories] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# KT MODE 2 — DOCUMENT UPLOAD
+# =============================================================================
+
+@app.post("/api/plans/{plan_id}/import-doc")
+async def import_document(plan_id: str, file: UploadFile = File(...)):
+    """
+    Upload a PDF / DOCX / TXT document, extract text, parse into scenarios.
+    """
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    plan = PLANS[plan_id]
+    base_url = plan.get("url", "/")
+
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:  # 10 MB limit
+        raise HTTPException(status_code=413, detail="File too large (max 10 MB)")
+
+    try:
+        from src.services.llm_service import LLMService
+        from src.agents.doc_parser import parse_document_file
+
+        llm = LLMService()
+        result = parse_document_file(content, file.filename or "document.txt", base_url=base_url, llm_service=llm)
+
+        existing_plan = plan.get("test_plan") or {"base_url": base_url, "total_scenarios": 0, "modules": {}}
+        merged = _merge_scenario_modules(existing_plan, result)
+        PLANS[plan_id]["test_plan"] = merged
+        PLANS[plan_id]["status"] = "ready"
+
+        kt_sources = PLANS[plan_id].setdefault("kt_sources", [])
+        kt_sources.append({
+            "type": "document",
+            "filename": file.filename,
+            "added_at": datetime.now().isoformat(),
+            "scenarios_added": result.get("total_scenarios", 0),
+            "extracted_chars": result.get("extracted_chars", 0),
+        })
+
+        save_plans(PLANS)
+
+        return {
+            "status": "ok",
+            "filename": file.filename,
+            "extracted_chars": result.get("extracted_chars", 0),
+            "scenarios_added": result.get("total_scenarios", 0),
+            "total_scenarios": merged.get("total_scenarios", 0),
+        }
+    except Exception as e:
+        logger.error(f"[import-doc] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# KT MODE 3 — AI-GUIDED CHAT
+# =============================================================================
+
+class ChatMessageRequest(BaseModel):
+    message: str
+
+
+@app.post("/api/plans/{plan_id}/chat")
+async def plan_chat(plan_id: str, request: ChatMessageRequest):
+    """Send a message to the KT Chat agent and get a reply."""
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    try:
+        from src.services.llm_service import LLMService
+        from src.agents.kt_chat import process_chat_message
+
+        llm = LLMService()
+        plan = PLANS[plan_id]
+        result = process_chat_message(plan_id, request.message, plan, llm_service=llm)
+
+        # Save updated plan (chat_history + app_knowledge were mutated in-place)
+        save_plans(PLANS)
+
+        return result
+    except Exception as e:
+        logger.error(f"[plan-chat] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/plans/{plan_id}/chat")
+async def get_chat_history(plan_id: str):
+    """Get the chat history and opening message for a plan."""
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    plan = PLANS[plan_id]
+    history = plan.get("chat_history", [])
+
+    if not history:
+        # Return opening message
+        try:
+            from src.services.llm_service import LLMService
+            from src.agents.kt_chat import get_chat_opening
+
+            llm = LLMService()
+            opening = get_chat_opening(plan, llm_service=llm)
+            return {"history": [], "opening": opening}
+        except Exception as e:
+            return {"history": [], "opening": {"reply": "Hello! Tell me about your application and I'll help generate better tests.", "turn": 0}}
+
+    return {"history": history, "opening": None}
+
+
+@app.post("/api/plans/{plan_id}/chat/apply")
+async def apply_chat_knowledge(plan_id: str):
+    """Regenerate test plan using knowledge gathered from chat."""
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    plan = PLANS[plan_id]
+    app_map = plan.get("app_map") or {"base_url": plan["url"], "total_pages": 0, "pages": [], "modules": {}, "auth_pages": []}
+    app_knowledge = plan.get("app_knowledge") or {}
+
+    try:
+        from src.services.llm_service import LLMService
+        from src.agents.planner import generate_test_plan
+
+        llm = LLMService()
+        new_plan = generate_test_plan(app_map=app_map, app_knowledge=app_knowledge, llm_service=llm)
+        PLANS[plan_id]["test_plan"] = new_plan
+        PLANS[plan_id]["status"] = "ready"
+        save_plans(PLANS)
+
+        return {
+            "status": "ok",
+            "total_scenarios": new_plan.get("total_scenarios", 0),
+        }
+    except Exception as e:
+        logger.error(f"[chat-apply] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# KT MODE 4 — SESSION RECORDING
+# =============================================================================
+
+@app.post("/api/session-record/start")
+async def start_session_record(body: dict):
+    """
+    Start a visible browser recording session.
+    Body: { "url": "https://...", "plan_id": "optional" }
+    """
+    url = body.get("url")
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+
+    plan_id = body.get("plan_id")
+
+    try:
+        from src.services.llm_service import LLMService
+        from src.agents.session_recorder import get_recorder
+
+        llm = LLMService()
+        recorder = get_recorder(llm_service=llm)
+        session_id = recorder.start_session(url, plan_id=plan_id)
+
+        return {"session_id": session_id, "status": "recording", "url": url}
+    except Exception as e:
+        logger.error(f"[session-record/start] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/session-record/{session_id}")
+async def get_session_status(session_id: str):
+    """Poll session recording status and event count."""
+    from src.agents.session_recorder import SESSIONS
+
+    if session_id not in SESSIONS:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    s = SESSIONS[session_id]
+    return {
+        "id": session_id,
+        "status": s["status"],
+        "events_count": len(s.get("events", [])),
+        "url": s["url"],
+        "created_at": s["created_at"],
+        "stopped_at": s.get("stopped_at"),
+        "error": s.get("error"),
+    }
+
+
+@app.post("/api/session-record/{session_id}/stop")
+async def stop_session_record(session_id: str):
+    """Stop recording, analyse events, optionally merge into plan."""
+    from src.agents.session_recorder import SESSIONS
+
+    if session_id not in SESSIONS:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = SESSIONS[session_id]
+    # Signal stop
+    session["status"] = "stopping"
+
+    try:
+        from src.services.llm_service import LLMService
+        from src.agents.session_recorder import get_recorder
+
+        llm = LLMService()
+        recorder = get_recorder(llm_service=llm)
+        result = recorder.stop_session(session_id)
+
+        plan_id = session.get("plan_id")
+
+        if plan_id and plan_id in PLANS:
+            # ── Merge into existing plan ──────────────────────────────────────
+            base_url = PLANS[plan_id].get("url", "/")
+            existing_plan = PLANS[plan_id].get("test_plan") or {"base_url": base_url, "total_scenarios": 0, "modules": {}}
+            merged = _merge_scenario_modules(existing_plan, result.get("scenarios", {}))
+            PLANS[plan_id]["test_plan"] = merged
+            PLANS[plan_id]["status"] = "ready"
+
+            kt_sources = PLANS[plan_id].setdefault("kt_sources", [])
+            kt_sources.append({
+                "type": "session_recording",
+                "added_at": datetime.now().isoformat(),
+                "events_count": result.get("events_count", 0),
+                "scenarios_added": result.get("scenarios", {}).get("total_scenarios", 0),
+            })
+            save_plans(PLANS)
+            result["plan_id"] = plan_id
+
+        else:
+            # ── No existing plan — create a new standalone plan from recording ─
+            import uuid
+            session_url = session.get("url", "")
+            new_plan_id = str(uuid.uuid4())
+            scenarios = result.get("scenarios", {})
+            total = scenarios.get("total_scenarios", 0)
+
+            PLANS[new_plan_id] = {
+                "id": new_plan_id,
+                "url": session_url,
+                "status": "ready",
+                "created_at": datetime.now().isoformat(),
+                "source": "session_recording",
+                "app_map": None,
+                "app_knowledge": None,
+                "test_plan": scenarios if total > 0 else None,
+                "kt_sources": [{
+                    "type": "session_recording",
+                    "added_at": datetime.now().isoformat(),
+                    "events_count": result.get("events_count", 0),
+                    "scenarios_added": total,
+                }],
+            }
+            save_plans(PLANS)
+            result["plan_id"] = new_plan_id
+
+        return result
+    except Exception as e:
+        logger.error(f"[session-record/stop] {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# HELPER — merge scenario modules from two test plans
+# =============================================================================
+
+# =============================================================================
+# KNOWLEDGE CACHE MANAGEMENT
+# =============================================================================
+
+@app.get("/api/knowledge-cache")
+async def list_knowledge_cache():
+    """List all cached app knowledge entries."""
+    from src.agents.knowledge_cache import get_cache
+    return {"entries": get_cache().list_entries()}
+
+
+@app.delete("/api/knowledge-cache/{url_key}")
+async def invalidate_cache(url_key: str):
+    """Force re-synthesis for a URL on next explore."""
+    from src.agents.knowledge_cache import get_cache
+    cache = get_cache()
+    cache.invalidate(url_key)
+    return {"status": "invalidated"}
+
+
+@app.get("/api/skills")
+async def list_skills():
+    """List all available domain skill files."""
+    from src.agents.skills_loader import get_skills_loader
+    return {"skills": get_skills_loader().list_skills()}
+
+
+@app.get("/api/plans/{plan_id}/active-skills")
+async def get_active_skills(plan_id: str):
+    """
+    Returns which skill files are currently active for this plan's domain.
+    Used by the frontend to show 'Active Skills' badges.
+    """
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    from src.agents.skills_loader import get_skills_loader
+    plan = PLANS[plan_id]
+    knowledge = plan.get("app_knowledge") or {}
+
+    active = get_skills_loader().get_active_skill_names(
+        domain=knowledge.get("domain", ""),
+        vocabulary=knowledge.get("domain_vocabulary", []),
+        app_description=knowledge.get("app_description", ""),
+    )
+    return {
+        "plan_id": plan_id,
+        "domain": knowledge.get("domain", ""),
+        "active_skills": active,
+    }
+
+
+def _merge_scenario_modules(existing_plan: Dict, new_result: Dict) -> Dict:
+    """
+    Merge modules + scenarios from new_result into existing_plan.
+    Avoids duplicate scenario IDs.
+    """
+    existing_modules = existing_plan.get("modules", {})
+    new_modules = new_result.get("modules", {})
+
+    for mod_key, mod_data in new_modules.items():
+        if mod_key not in existing_modules:
+            existing_modules[mod_key] = mod_data
+        else:
+            existing_ids = {s["id"] for s in existing_modules[mod_key].get("scenarios", [])}
+            for scenario in mod_data.get("scenarios", []):
+                if scenario["id"] not in existing_ids:
+                    existing_modules[mod_key]["scenarios"].append(scenario)
+                    existing_ids.add(scenario["id"])
+
+    total = sum(len(m.get("scenarios", [])) for m in existing_modules.values())
+    return {
+        **existing_plan,
+        "modules": existing_modules,
+        "total_scenarios": total,
+    }
 
 
 if __name__ == "__main__":

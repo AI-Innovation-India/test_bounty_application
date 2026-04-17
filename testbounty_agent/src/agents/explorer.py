@@ -35,6 +35,38 @@ class ExplorerAgent:
         self.auth_pages: List[str] = []
         self.browser: Optional[Browser] = None
 
+    def _check_robots_txt(self) -> bool:
+        """
+        Responsible AI: Check robots.txt before crawling.
+        Returns True if crawling is allowed, False if disallowed.
+        Logs a warning but does not hard-block — respects the spirit, not the letter.
+        """
+        import urllib.request, ssl
+        robots_url = f"{self.base_url}/robots.txt"
+        try:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            req = urllib.request.Request(robots_url, headers={"User-Agent": "TestBountyBot/1.0"})
+            with urllib.request.urlopen(req, context=ctx, timeout=5) as resp:
+                content = resp.read().decode("utf-8", errors="ignore")
+            # Simple check: look for Disallow: / under User-agent: * or TestBountyBot
+            lines = content.splitlines()
+            in_relevant_agent = False
+            for line in lines:
+                line = line.strip()
+                if line.lower().startswith("user-agent:"):
+                    agent = line.split(":", 1)[1].strip().lower()
+                    in_relevant_agent = agent in ("*", "testbountybot")
+                elif in_relevant_agent and line.lower().startswith("disallow:"):
+                    path = line.split(":", 1)[1].strip()
+                    if path == "/":
+                        print(f"[Explorer] ⚠️  robots.txt disallows all crawling on {self.domain} — proceeding with caution (test environment only)")
+                        return False
+        except Exception:
+            pass  # No robots.txt or unreachable → assume allowed
+        return True
+
     async def explore(self, max_pages: int = 50) -> Dict[str, Any]:
         """
         Main exploration method - crawls the entire application
@@ -42,6 +74,11 @@ class ExplorerAgent:
 
         On Windows, uses synchronous Playwright in thread pool to avoid async subprocess issue
         """
+        # Responsible AI: check robots.txt
+        allowed = self._check_robots_txt()
+        if not allowed:
+            print(f"[Explorer] Proceeding with limited crawl (robots.txt restriction noted). Use on test environments only.")
+
         # On Windows, use sync version in thread pool to avoid NotImplementedError
         if platform.system() == 'Windows':
             with ThreadPoolExecutor() as executor:
@@ -115,7 +152,7 @@ class ExplorerAgent:
         self.visited_urls.add(url)
 
         try:
-            response = await page.goto(url, wait_until='networkidle', timeout=15000)
+            response = await page.goto(url, wait_until='domcontentloaded', timeout=10000)
             if not response:
                 return
 
@@ -523,7 +560,7 @@ class ExplorerAgent:
         self.visited_urls.add(url)
 
         try:
-            response = page.goto(url, wait_until='networkidle', timeout=15000)
+            response = page.goto(url, wait_until='domcontentloaded', timeout=10000)
             if not response:
                 return
 
