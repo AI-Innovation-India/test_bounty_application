@@ -249,43 +249,120 @@ class SessionRecorderAgent:
 
         return self._rule_convert(events, base_url)
 
+    # Known SSO/OAuth provider domains — navigate steps to these are replaced
+    _SSO_DOMAINS = (
+        "b2clogin.com", "login.microsoftonline.com", "accounts.microsoft.com",
+        "login.microsoft.com", "okta.com", "auth0.com", "onelogin.com",
+        "ping.com", "pingidentity.com", "accounts.google.com", "appleid.apple.com",
+        "facebook.com/login", "github.com/login",
+    )
+
+    def _is_sso_url(self, url: str) -> bool:
+        return any(d in url for d in self._SSO_DOMAINS)
+
     def _llm_convert(self, events: List[Dict], base_url: str) -> Dict:
-        from langchain_core.prompts import ChatPromptTemplate
+        """
+        AI-powered conversion: analyse the recorded session to produce FULL
+        module coverage — positive paths, negative paths, edge cases, and
+        security checks — not just a replay of what was recorded.
+        """
         from langchain_core.output_parsers import StrOutputParser
 
-        # Summarize events (cap at 80 events for prompt size)
-        event_summary = json.dumps(events[:80], indent=2)
+        # ── Build page-type map from navigation events ────────────────────────
+        pages_visited = []
+        sso_detected = False
+        for ev in events:
+            if ev.get("type") == "navigate":
+                url = ev.get("url", "")
+                if self._is_sso_url(url):
+                    sso_detected = True
+                else:
+                    clean = self._sanitise_url(url)
+                    if clean and clean not in pages_visited:
+                        pages_visited.append(clean)
 
-        prompt = ChatPromptTemplate.from_template("""
-You are a QA expert analyzing a recorded user session to generate test scenarios.
+        # ── Compact event summary (strip noise, cap size) ─────────────────────
+        meaningful = [
+            e for e in events
+            if e.get("type") in ("navigate", "fill", "click", "submit")
+            and not self._is_sso_url(e.get("url", "") or e.get("_url", ""))
+        ][:60]
+
+        # Sanitise navigate URLs in events before sending to LLM
+        for ev in meaningful:
+            if ev.get("type") == "navigate" and ev.get("url"):
+                ev["url"] = self._sanitise_url(ev["url"])
+
+        # ── Load relevant skills context ──────────────────────────────────────
+        try:
+            from src.agents.skills_loader import get_skills_loader
+            vocab = [e.get("text", "") for e in events if e.get("text")] + pages_visited
+            skills_ctx = get_skills_loader().get_skills_for_context(
+                domain="",
+                vocabulary=vocab,
+                app_description=f"App at {base_url}",
+            )
+        except Exception:
+            skills_ctx = ""
+
+        sso_note = (
+            "\nNOTE: SSO/OAuth redirect detected (Azure B2C / Microsoft login). "
+            "The test should navigate to the app URL and handle SSO as an auth prerequisite, "
+            "not navigate directly to the SSO provider URL."
+            if sso_detected else ""
+        )
+
+        prompt = f"""You are a senior QA engineer with deep application testing expertise.
+A user recorded their session while using an application. Your job is NOT just to replay
+what they did — you must use the recording as a CLUE to understand the application, then
+generate COMPREHENSIVE test scenarios for each module/page visited.
 
 BASE URL: {base_url}
-RECORDED EVENTS (user interactions):
-{events}
+PAGES VISITED: {json.dumps(pages_visited)}
+{sso_note}
 
-TASK:
-1. Identify distinct user flows from the events (e.g., "Login flow", "Search flow", "Checkout flow")
-2. Convert each flow into a test scenario with proper Playwright steps
-3. Use the actual selectors from the recorded events
-4. Group scenarios by module
+RECORDED INTERACTIONS (condensed):
+{json.dumps(meaningful, indent=2)}
 
-Return ONLY valid JSON:
+{skills_ctx}
+
+=== YOUR TASK ===
+For EACH page/module the user visited, generate a FULL set of test scenarios:
+- At least 1 happy path (valid data, successful flow)
+- At least 1 error path (invalid data, wrong credentials, missing fields)
+- At least 1 edge case (boundary, empty state, special characters)
+- Security test where relevant (auth bypass, SQL injection on login forms)
+
+Rules:
+1. Use the ACTUAL selectors from the recorded events for happy-path steps
+2. For negative/edge cases, re-use the same page URL and selectors but change the values
+3. Identify the module from the page URL/content:
+   - /login, /signin → "auth" module
+   - /home, /dashboard, / → "home" module
+   - /asset, /tracking, /fleet, /device → "tracking" module
+   - /report → "reports" module
+   - /setting, /profile, /account → "settings" module
+4. SSO flows: the happy path navigate step should go to the app base URL ({base_url}),
+   NOT to the SSO provider URL
+5. Each scenario must have a unique id like "rec_NNN" (increment from 001)
+
+Return ONLY valid JSON in this exact structure:
 {{
   "modules": {{
-    "module_name": {{
-      "name": "Module Name",
-      "requires_auth": false,
+    "<module_name>": {{
+      "name": "<Display Name>",
+      "requires_auth": <true|false>,
       "scenarios": [
         {{
           "id": "rec_001",
-          "name": "Flow name",
-          "description": "What this flow tests",
-          "module": "module_name",
-          "type": "happy_path",
-          "priority": "high",
+          "name": "<descriptive name e.g. 'Valid Login - SSO'>",
+          "description": "<what this tests and why it matters>",
+          "module": "<module_name>",
+          "type": "happy_path|error_path|edge_case|security",
+          "priority": "high|medium|low",
           "depends_on": null,
           "steps": [
-            {{"action": "navigate", "target": "url_or_selector", "value": null, "description": "step"}}
+            {{"action": "navigate|fill|click|assert|wait", "target": "<url or CSS selector>", "value": "<string or null>", "description": "<plain English>"}}
           ],
           "status": "pending",
           "source": "session_recording"
@@ -293,16 +370,18 @@ Return ONLY valid JSON:
       ]
     }}
   }},
-  "total_scenarios": 0
-}}
-""")
-        chain = prompt | self.llm.model | StrOutputParser()
-        response = chain.invoke({"events": event_summary, "base_url": base_url})
-        response = response.replace("```json", "").replace("```", "").strip()
-        result = json.loads(response)
+  "total_scenarios": <number>
+}}"""
+
+        response = self.llm.model.invoke(prompt)
+        content = getattr(response, "content", str(response)).strip()
+        content = content.replace("```json", "").replace("```", "").strip()
+
+        result = json.loads(content)
         total = sum(len(m.get("scenarios", [])) for m in result.get("modules", {}).values())
         result["total_scenarios"] = total
         result["source"] = "session_recording"
+        result["sso_detected"] = sso_detected
         return result
 
     def _rule_convert(self, events: List[Dict], base_url: str) -> Dict:
@@ -360,12 +439,37 @@ Return ONLY valid JSON:
         total = sum(len(m["scenarios"]) for m in modules.values())
         return {"modules": modules, "total_scenarios": total, "source": "session_recording"}
 
+    # Query params that are transient/session-specific and should be stripped
+    _TRANSIENT_PARAMS = frozenset({
+        "csrf_token", "csrftoken", "_token", "state", "nonce", "code",
+        "session", "sessionid", "session_id", "sid",
+        "rememberMe", "remember_me",
+        "timestamp", "ts", "t", "_t",
+        "sig", "signature", "hmac",
+    })
+
+    def _sanitise_url(self, url: str) -> str:
+        """Strip transient/session query params that expire between record and replay."""
+        try:
+            from urllib.parse import urlparse, urlencode, parse_qsl
+            parsed = urlparse(url)
+            clean_params = [
+                (k, v) for k, v in parse_qsl(parsed.query)
+                if k.lower() not in self._TRANSIENT_PARAMS
+            ]
+            clean = parsed._replace(query=urlencode(clean_params))
+            return clean.geturl()
+        except Exception:
+            return url
+
     def _flow_to_steps(self, flow: List[Dict]) -> List[Dict]:
         steps = []
         for ev in flow:
             t = ev.get("type")
             if t == "navigate":
-                steps.append({"action": "navigate", "target": ev.get("url", "/"), "value": None, "description": f"Navigate to {ev.get('url', '/')}"})
+                raw_url = ev.get("url", "/")
+                clean_url = self._sanitise_url(raw_url)
+                steps.append({"action": "navigate", "target": clean_url, "value": None, "description": f"Navigate to {clean_url}"})
             elif t == "fill":
                 sel = ev.get("selector", "input")
                 val = ev.get("value", "")

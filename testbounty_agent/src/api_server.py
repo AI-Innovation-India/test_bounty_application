@@ -508,100 +508,182 @@ def save_test_suites(suites):
 
 TEST_SUITES = load_test_suites()
 
+class ScenarioRef(BaseModel):
+    plan_id: str
+    scenario_id: str
+    scenario_name: Optional[str] = ""
+    module: Optional[str] = ""
+
 class TestSuiteCreate(BaseModel):
     name: str
     description: Optional[str] = ""
-    tests: List[str] = []  # List of run IDs or test identifiers
-    schedule: Optional[str] = None  # Cron expression or simple like "hourly", "daily"
+    suite_type: Optional[str] = "regression"  # regression | smoke | sanity | custom
+    scenario_refs: List[ScenarioRef] = []
+    # Legacy field kept for backward compat
+    tests: List[str] = []
 
 class TestSuiteUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
-    tests: Optional[List[str]] = None
-    schedule: Optional[str] = None
+    suite_type: Optional[str] = None
+    scenario_refs: Optional[List[ScenarioRef]] = None
+
+class AddScenariosRequest(BaseModel):
+    scenario_refs: List[ScenarioRef]
 
 @app.get("/api/test-suites")
 async def list_test_suites():
-    """List all test suites."""
-    return list(TEST_SUITES.values())
+    """List all test suites with scenario counts."""
+    suites = list(TEST_SUITES.values())
+    for s in suites:
+        s.setdefault("scenario_refs", [])
+        s.setdefault("suite_type", "regression")
+    return suites
 
 @app.post("/api/test-suites")
 async def create_test_suite(suite: TestSuiteCreate):
     """Create a new test suite."""
     suite_id = str(uuid.uuid4())
-    from datetime import datetime
-
     new_suite = {
         "id": suite_id,
         "name": suite.name,
         "description": suite.description,
-        "tests": suite.tests,
-        "schedule": suite.schedule,
+        "suite_type": suite.suite_type or "regression",
+        "scenario_refs": [r.dict() for r in suite.scenario_refs],
         "created_at": datetime.now().isoformat(),
         "last_run": None,
-        "status": "idle"
+        "last_run_id": None,
+        "status": "idle",
+        "pass_rate": None,
     }
-
     TEST_SUITES[suite_id] = new_suite
     save_test_suites(TEST_SUITES)
-
     return new_suite
 
 @app.get("/api/test-suites/{suite_id}")
 async def get_test_suite(suite_id: str):
-    """Get a specific test suite."""
     if suite_id not in TEST_SUITES:
         raise HTTPException(status_code=404, detail="Test suite not found")
-    return TEST_SUITES[suite_id]
+    s = TEST_SUITES[suite_id]
+    s.setdefault("scenario_refs", [])
+    s.setdefault("suite_type", "regression")
+    return s
 
 @app.put("/api/test-suites/{suite_id}")
 async def update_test_suite(suite_id: str, suite: TestSuiteUpdate):
-    """Update a test suite."""
     if suite_id not in TEST_SUITES:
         raise HTTPException(status_code=404, detail="Test suite not found")
-
     existing = TEST_SUITES[suite_id]
-
     if suite.name is not None:
         existing["name"] = suite.name
     if suite.description is not None:
         existing["description"] = suite.description
-    if suite.tests is not None:
-        existing["tests"] = suite.tests
-    if suite.schedule is not None:
-        existing["schedule"] = suite.schedule
-
+    if suite.suite_type is not None:
+        existing["suite_type"] = suite.suite_type
+    if suite.scenario_refs is not None:
+        existing["scenario_refs"] = [r.dict() for r in suite.scenario_refs]
     TEST_SUITES[suite_id] = existing
     save_test_suites(TEST_SUITES)
-
     return existing
+
+@app.post("/api/test-suites/{suite_id}/add-scenarios")
+async def add_scenarios_to_suite(suite_id: str, request: AddScenariosRequest):
+    """Add scenarios to an existing suite (append, deduplicates by scenario_id)."""
+    if suite_id not in TEST_SUITES:
+        raise HTTPException(status_code=404, detail="Test suite not found")
+    suite = TEST_SUITES[suite_id]
+    existing_ids = {r["scenario_id"] for r in suite.get("scenario_refs", [])}
+    added = 0
+    for ref in request.scenario_refs:
+        if ref.scenario_id not in existing_ids:
+            suite.setdefault("scenario_refs", []).append(ref.dict())
+            existing_ids.add(ref.scenario_id)
+            added += 1
+    save_test_suites(TEST_SUITES)
+    return {"status": "ok", "added": added, "total": len(suite["scenario_refs"])}
+
+@app.delete("/api/test-suites/{suite_id}/scenarios/{scenario_id}")
+async def remove_scenario_from_suite(suite_id: str, scenario_id: str):
+    """Remove a specific scenario from a suite."""
+    if suite_id not in TEST_SUITES:
+        raise HTTPException(status_code=404, detail="Test suite not found")
+    suite = TEST_SUITES[suite_id]
+    before = len(suite.get("scenario_refs", []))
+    suite["scenario_refs"] = [r for r in suite.get("scenario_refs", []) if r["scenario_id"] != scenario_id]
+    save_test_suites(TEST_SUITES)
+    return {"status": "ok", "removed": before - len(suite["scenario_refs"])}
 
 @app.delete("/api/test-suites/{suite_id}")
 async def delete_test_suite(suite_id: str):
-    """Delete a test suite."""
     if suite_id not in TEST_SUITES:
         raise HTTPException(status_code=404, detail="Test suite not found")
-
     del TEST_SUITES[suite_id]
     save_test_suites(TEST_SUITES)
-
     return {"status": "deleted", "suite_id": suite_id}
 
 @app.post("/api/test-suites/{suite_id}/run")
 async def run_test_suite(suite_id: str, background_tasks: BackgroundTasks):
-    """Run all tests in a suite."""
+    """Run all scenarios in a suite grouped by their source plan."""
     if suite_id not in TEST_SUITES:
         raise HTTPException(status_code=404, detail="Test suite not found")
 
     suite = TEST_SUITES[suite_id]
-    from datetime import datetime
+    refs = suite.get("scenario_refs", [])
+    if not refs:
+        raise HTTPException(status_code=400, detail="Suite has no scenarios")
+
+    # Group scenario IDs by plan_id
+    plan_groups: Dict[str, List[str]] = {}
+    for ref in refs:
+        pid = ref["plan_id"]
+        sid = ref["scenario_id"]
+        if pid not in plan_groups:
+            plan_groups[pid] = []
+        plan_groups[pid].append(sid)
+
+    # Launch a run for each plan group
+    run_ids = []
+    for pid, sids in plan_groups.items():
+        if pid not in PLANS:
+            continue
+        plan = PLANS[pid]
+        test_plan = plan.get("test_plan", {})
+        # Collect full scenario dicts for the requested IDs
+        scenarios_to_run = [
+            sc for mod in test_plan.get("modules", {}).values()
+            for sc in mod.get("scenarios", [])
+            if sc["id"] in sids
+        ]
+        if not scenarios_to_run:
+            continue
+        run_id = str(uuid.uuid4())
+        RUNS[run_id] = {
+            "id": run_id,
+            "plan_id": pid,
+            "type": "suite_run",
+            "target_url": plan["url"],
+            "test_name": f"Suite: {suite['name']}",
+            "scenarios": scenarios_to_run,
+            "status": "pending",
+            "results": {},
+            "created_at": datetime.now().isoformat(),
+            "suite_id": suite_id,
+        }
+        save_runs()
+        background_tasks.add_task(run_scenarios_task, run_id, plan["url"], scenarios_to_run, "chromium", None)
+        run_ids.append(run_id)
+
     suite["last_run"] = datetime.now().isoformat()
     suite["status"] = "running"
+    suite["last_run_id"] = run_ids[0] if len(run_ids) == 1 else None
     save_test_suites(TEST_SUITES)
 
-    # TODO: Actually run the tests in the suite
-    # For now, just mark as completed after a delay
-    return {"status": "started", "suite_id": suite_id, "tests_count": len(suite["tests"])}
+    return {
+        "status": "started",
+        "suite_id": suite_id,
+        "run_ids": run_ids,
+        "scenarios_count": len(refs),
+    }
 
 
 # =============================================
@@ -1303,23 +1385,34 @@ def execute_scenario_sync(page, scenario: Dict, base_url: str, healer=None) -> D
 
             if action == "navigate":
                 url = target if target.startswith("http") else f"{base_url}{target}"
-                page.goto(url, wait_until="networkidle", timeout=15000)
+                # If URL is an SSO/OAuth provider, navigate to app base URL instead
+                # and let the natural redirect chain handle the auth flow
+                _SSO_DOMAINS = (
+                    "b2clogin.com", "login.microsoftonline.com", "accounts.microsoft.com",
+                    "okta.com", "auth0.com", "onelogin.com", "accounts.google.com",
+                )
+                if any(d in url for d in _SSO_DOMAINS):
+                    url = base_url
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass  # networkidle timeout is non-fatal — page is loaded enough
 
             elif action == "fill":
-                # Try multiple selectors
                 selectors = target.split(", ")
                 filled = False
                 for selector in selectors:
                     try:
-                        elem = page.wait_for_selector(selector.strip(), timeout=3000)
+                        elem = page.wait_for_selector(selector.strip(), state="visible", timeout=8000)
                         if elem:
+                            elem.scroll_into_view_if_needed()
                             elem.fill(value or "")
                             filled = True
                             break
                     except:
                         continue
                 if not filled:
-                    # Try self-healing before giving up
                     if healer:
                         html = page.content()
                         healed_step = healer.heal_selector(step, html, page.url)
@@ -1327,8 +1420,9 @@ def execute_scenario_sync(page, scenario: Dict, base_url: str, healer=None) -> D
                             new_selectors = healed_step["target"].split(", ")
                             for sel in new_selectors:
                                 try:
-                                    elem = page.wait_for_selector(sel.strip(), timeout=3000)
+                                    elem = page.wait_for_selector(sel.strip(), state="visible", timeout=8000)
                                     if elem:
+                                        elem.scroll_into_view_if_needed()
                                         elem.fill(value or "")
                                         filled = True
                                         step["target"] = healed_step["target"]
@@ -1343,15 +1437,15 @@ def execute_scenario_sync(page, scenario: Dict, base_url: str, healer=None) -> D
                 clicked = False
                 for selector in selectors:
                     try:
-                        elem = page.wait_for_selector(selector.strip(), timeout=3000)
+                        elem = page.wait_for_selector(selector.strip(), state="visible", timeout=8000)
                         if elem:
+                            elem.scroll_into_view_if_needed()
                             elem.click()
                             clicked = True
                             break
                     except:
                         continue
                 if not clicked:
-                    # Try self-healing before giving up
                     if healer:
                         html = page.content()
                         healed_step = healer.heal_selector(step, html, page.url)
@@ -1359,8 +1453,9 @@ def execute_scenario_sync(page, scenario: Dict, base_url: str, healer=None) -> D
                             new_selectors = healed_step["target"].split(", ")
                             for sel in new_selectors:
                                 try:
-                                    elem = page.wait_for_selector(sel.strip(), timeout=3000)
+                                    elem = page.wait_for_selector(sel.strip(), state="visible", timeout=8000)
                                     if elem:
+                                        elem.scroll_into_view_if_needed()
                                         elem.click()
                                         clicked = True
                                         step["target"] = healed_step["target"]
@@ -1464,16 +1559,26 @@ async def execute_scenario(page, scenario: Dict, base_url: str) -> Dict:
 
             if action == "navigate":
                 url = target if target.startswith("http") else f"{base_url}{target}"
-                await page.goto(url, wait_until="networkidle", timeout=15000)
+                _SSO_DOMAINS = (
+                    "b2clogin.com", "login.microsoftonline.com", "accounts.microsoft.com",
+                    "okta.com", "auth0.com", "onelogin.com", "accounts.google.com",
+                )
+                if any(d in url for d in _SSO_DOMAINS):
+                    url = base_url
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass  # networkidle timeout is non-fatal
 
             elif action == "fill":
-                # Try multiple selectors
                 selectors = target.split(", ")
                 filled = False
                 for selector in selectors:
                     try:
-                        elem = await page.wait_for_selector(selector.strip(), timeout=3000)
+                        elem = await page.wait_for_selector(selector.strip(), state="visible", timeout=8000)
                         if elem:
+                            await elem.scroll_into_view_if_needed()
                             await elem.fill(value or "")
                             filled = True
                             break
@@ -1487,8 +1592,9 @@ async def execute_scenario(page, scenario: Dict, base_url: str) -> Dict:
                 clicked = False
                 for selector in selectors:
                     try:
-                        elem = await page.wait_for_selector(selector.strip(), timeout=3000)
+                        elem = await page.wait_for_selector(selector.strip(), state="visible", timeout=8000)
                         if elem:
+                            await elem.scroll_into_view_if_needed()
                             await elem.click()
                             clicked = True
                             break

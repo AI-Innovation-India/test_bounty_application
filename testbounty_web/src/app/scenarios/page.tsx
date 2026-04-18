@@ -7,8 +7,8 @@ import {
     getScenarioVideoFileUrl, importStories, importDocument,
     sendChatMessage, getChatHistory, applyChatKnowledge,
     startSessionRecord, getSessionRecord, stopSessionRecord,
-    getActiveSkills,
-    type ChatMessage
+    getActiveSkills, addScenariosToSuite,
+    type ChatMessage, type TestSuite, type ScenarioRef
 } from "@/lib/api";
 import {
     Search, Play, CheckCircle, XCircle, Clock, ChevronDown, ChevronRight,
@@ -16,7 +16,7 @@ import {
     Video, Code, X, Download, Copy, Brain, Plus, Minus, Users,
     BookOpen, AlertCircle, Lightbulb, ChevronUp, Settings2,
     MessageSquare, Upload, FileText, Send, StopCircle,
-    Circle, Mic, Paperclip, CheckSquare
+    Circle, Mic, Paperclip, CheckSquare, FolderPlus, Layers
 } from "lucide-react";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -97,6 +97,14 @@ export default function ScenariosPage() {
 
     // Shadow Mode standalone URL
     const [recordUrl, setRecordUrl] = useState<string>("");
+
+    // Add to Suite modal
+    const [suiteModalOpen, setSuiteModalOpen] = useState(false);
+    const [suiteModalScenario, setSuiteModalScenario] = useState<{id: string; name: string; module: string} | null>(null);
+    const [suites, setSuites] = useState<TestSuite[]>([]);
+    const [newSuiteName, setNewSuiteName] = useState("");
+    const [newSuiteType, setNewSuiteType] = useState<string>("regression");
+    const [addingToSuite, setAddingToSuite] = useState(false);
 
     // Video & Code Preview
     const [activeRunId, setActiveRunId] = useState<string | null>(null);
@@ -342,6 +350,49 @@ export default function ScenariosPage() {
             setToast({ message: `Recording analysed — ${count} scenarios created!`, type: "success" });
         } catch (_) { setToast({ message: "Failed to stop recording", type: "error" }); }
         finally { setStoppingRecord(false); setRecordingSessionId(null); }
+    };
+
+    // ── Add to Suite ─────────────────────────────────────────────────────────
+
+    const openSuiteModal = async (scenario: {id: string; name: string; module: string}) => {
+        setSuiteModalScenario(scenario);
+        setSuiteModalOpen(true);
+        try { setSuites(await api.listTestSuites()); } catch (_) {}
+    };
+
+    const handleAddToSuite = async (suiteId: string) => {
+        if (!suiteModalScenario || !selectedPlan) return;
+        setAddingToSuite(true);
+        try {
+            const ref: ScenarioRef = {
+                plan_id: selectedPlan.id,
+                scenario_id: suiteModalScenario.id,
+                scenario_name: suiteModalScenario.name,
+                module: suiteModalScenario.module,
+            };
+            await addScenariosToSuite(suiteId, [ref]);
+            setToast({ message: `Added to suite "${suites.find(s => s.id === suiteId)?.name}"`, type: "success" });
+            setSuiteModalOpen(false);
+        } catch (_) { setToast({ message: "Failed to add to suite", type: "error" }); }
+        finally { setAddingToSuite(false); }
+    };
+
+    const handleCreateAndAddSuite = async () => {
+        if (!newSuiteName.trim() || !suiteModalScenario || !selectedPlan) return;
+        setAddingToSuite(true);
+        try {
+            const ref: ScenarioRef = {
+                plan_id: selectedPlan.id,
+                scenario_id: suiteModalScenario.id,
+                scenario_name: suiteModalScenario.name,
+                module: suiteModalScenario.module,
+            };
+            const suite = await api.createTestSuite({ name: newSuiteName.trim(), suite_type: newSuiteType, scenario_refs: [ref] });
+            setToast({ message: `Created suite "${suite.name}" and added scenario`, type: "success" });
+            setSuiteModalOpen(false);
+            setNewSuiteName("");
+        } catch (_) { setToast({ message: "Failed to create suite", type: "error" }); }
+        finally { setAddingToSuite(false); }
     };
 
     // ── Run ───────────────────────────────────────────────────────────────────
@@ -959,7 +1010,7 @@ export default function ScenariosPage() {
                                                 const isExp = expandedScenarios.has(scenario.id);
                                                 return (
                                                     <div key={scenario.id} className="border-b border-white/5 last:border-0">
-                                                        <div className={`flex items-center justify-between p-3 hover:bg-white/5 transition-colors ${selectedScenarios.has(scenario.id) ? "bg-[#00D4AA]/5" : ""}`}>
+                                                        <div className={`group flex items-center justify-between p-3 hover:bg-white/5 transition-colors ${selectedScenarios.has(scenario.id) ? "bg-[#00D4AA]/5" : ""}`}>
                                                             <div className="flex items-center gap-3 min-w-0">
                                                                 <button onClick={() => toggleScenarioExpansion(scenario.id)} className="p-1 hover:bg-white/10 rounded shrink-0">
                                                                     {isExp ? <ChevronDown size={14} className="text-slate-400" /> : <ChevronRight size={14} className="text-slate-400" />}
@@ -978,6 +1029,13 @@ export default function ScenariosPage() {
                                                             </div>
                                                             <div className="flex items-center gap-1 shrink-0 ml-2">
                                                                 <span className="text-xs text-slate-600">{scenario.steps.length}s</span>
+                                                                <button
+                                                                    onClick={() => openSuiteModal({ id: scenario.id, name: scenario.name, module: modName })}
+                                                                    className="p-1.5 hover:bg-white/10 rounded opacity-0 group-hover:opacity-100 transition-opacity"
+                                                                    title="Add to Suite"
+                                                                >
+                                                                    <FolderPlus size={13} className="text-purple-400" />
+                                                                </button>
                                                                 {activeRunId && runResults[scenario.id] && (
                                                                     <>
                                                                         <button onClick={() => openVideoPreview(scenario)} className="p-1.5 hover:bg-white/10 rounded" title="Video"><Video size={13} className="text-blue-400" /></button>
@@ -1182,6 +1240,80 @@ export default function ScenariosPage() {
                     <div className={`fixed bottom-6 right-6 px-5 py-3 rounded-lg shadow-xl flex items-center gap-2 z-50 ${toast.type === "success" ? "bg-emerald-600" : "bg-red-600"} text-white`}>
                         {toast.type === "success" ? <CheckCircle size={16} /> : <XCircle size={16} />}
                         {toast.message}
+                    </div>
+                )}
+
+                {/* Add to Suite Modal */}
+                {suiteModalOpen && suiteModalScenario && (
+                    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50" onClick={() => setSuiteModalOpen(false)}>
+                        <div className="bg-[#121214] border border-white/10 rounded-xl w-full max-w-md" onClick={e => e.stopPropagation()}>
+                            <div className="flex items-center justify-between p-4 border-b border-white/5">
+                                <div className="flex items-center gap-2">
+                                    <FolderPlus size={16} className="text-purple-400" />
+                                    <h3 className="font-semibold text-white">Add to Suite</h3>
+                                </div>
+                                <button onClick={() => setSuiteModalOpen(false)} className="p-1.5 hover:bg-white/10 rounded"><X size={16} className="text-slate-400" /></button>
+                            </div>
+                            <div className="p-4 space-y-4">
+                                <p className="text-xs text-slate-400">
+                                    Adding <span className="text-white font-medium">{suiteModalScenario.name}</span> to a regression suite
+                                </p>
+
+                                {/* Existing suites */}
+                                {suites.length > 0 && (
+                                    <div>
+                                        <p className="text-xs font-semibold text-slate-500 uppercase mb-2">Add to existing suite</p>
+                                        <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                                            {suites.map(suite => (
+                                                <button
+                                                    key={suite.id}
+                                                    onClick={() => handleAddToSuite(suite.id)}
+                                                    disabled={addingToSuite}
+                                                    className="w-full flex items-center justify-between px-3 py-2 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 transition-colors disabled:opacity-50"
+                                                >
+                                                    <div className="flex items-center gap-2 min-w-0">
+                                                        <Layers size={13} className="text-purple-400 shrink-0" />
+                                                        <span className="text-sm text-white truncate">{suite.name}</span>
+                                                    </div>
+                                                    <div className="flex items-center gap-2 shrink-0">
+                                                        <span className={`text-xs px-1.5 py-0.5 rounded ${suite.suite_type === 'smoke' ? 'bg-orange-500/15 text-orange-400' : suite.suite_type === 'sanity' ? 'bg-blue-500/15 text-blue-400' : 'bg-purple-500/15 text-purple-400'}`}>
+                                                            {suite.suite_type}
+                                                        </span>
+                                                        <span className="text-xs text-slate-500">{suite.scenario_refs?.length || 0} scenarios</span>
+                                                    </div>
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Create new suite */}
+                                <div className="pt-2 border-t border-white/5">
+                                    <p className="text-xs font-semibold text-slate-500 uppercase mb-2">Or create new suite</p>
+                                    <input
+                                        value={newSuiteName}
+                                        onChange={e => setNewSuiteName(e.target.value)}
+                                        placeholder="Suite name (e.g. Login Regression)"
+                                        className="w-full px-3 py-2 bg-[#1a1a1d] border border-white/10 rounded-lg text-white text-sm placeholder:text-slate-600 focus:outline-none focus:border-purple-500/50 mb-2"
+                                    />
+                                    <div className="flex gap-2 mb-3">
+                                        {(["regression", "smoke", "sanity"] as const).map(t => (
+                                            <button key={t} onClick={() => setNewSuiteType(t)}
+                                                className={`flex-1 py-1.5 text-xs rounded-lg border transition-colors ${newSuiteType === t ? 'bg-purple-500/20 border-purple-500/40 text-purple-300' : 'bg-white/5 border-white/10 text-slate-400 hover:bg-white/10'}`}>
+                                                {t}
+                                            </button>
+                                        ))}
+                                    </div>
+                                    <button
+                                        onClick={handleCreateAndAddSuite}
+                                        disabled={!newSuiteName.trim() || addingToSuite}
+                                        className="w-full py-2 bg-purple-500 hover:bg-purple-400 text-white font-medium rounded-lg text-sm transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+                                    >
+                                        {addingToSuite ? <><Loader2 size={14} className="animate-spin" /> Creating...</> : <><Plus size={14} /> Create Suite & Add</>}
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 )}
 

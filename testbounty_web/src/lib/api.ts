@@ -108,15 +108,24 @@ export function getReportDownloadUrl(runId: string): string {
 // TEST SUITES API
 // =============================================
 
+export interface ScenarioRef {
+    plan_id: string;
+    scenario_id: string;
+    scenario_name?: string;
+    module?: string;
+}
+
 export interface TestSuite {
     id: string;
     name: string;
     description: string;
-    tests: string[];
-    schedule: string | null;
+    suite_type: 'regression' | 'smoke' | 'sanity' | 'custom';
+    scenario_refs: ScenarioRef[];
     created_at: string;
     last_run: string | null;
+    last_run_id: string | null;
     status: 'idle' | 'running' | 'passed' | 'failed';
+    pass_rate: number | null;
 }
 
 export async function listTestSuites(): Promise<TestSuite[]> {
@@ -128,8 +137,8 @@ export async function listTestSuites(): Promise<TestSuite[]> {
 export async function createTestSuite(data: {
     name: string;
     description?: string;
-    tests?: string[];
-    schedule?: string;
+    suite_type?: string;
+    scenario_refs?: ScenarioRef[];
 }): Promise<TestSuite> {
     const res = await fetch(`${API_BASE}/test-suites`, {
         method: 'POST',
@@ -149,8 +158,8 @@ export async function getTestSuite(suiteId: string): Promise<TestSuite> {
 export async function updateTestSuite(suiteId: string, data: {
     name?: string;
     description?: string;
-    tests?: string[];
-    schedule?: string;
+    suite_type?: string;
+    scenario_refs?: ScenarioRef[];
 }): Promise<TestSuite> {
     const res = await fetch(`${API_BASE}/test-suites/${suiteId}`, {
         method: 'PUT',
@@ -158,6 +167,24 @@ export async function updateTestSuite(suiteId: string, data: {
         body: JSON.stringify(data),
     });
     if (!res.ok) throw new Error('Failed to update test suite');
+    return res.json();
+}
+
+export async function addScenariosToSuite(suiteId: string, scenario_refs: ScenarioRef[]): Promise<{ status: string; added: number; total: number }> {
+    const res = await fetch(`${API_BASE}/test-suites/${suiteId}/add-scenarios`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ scenario_refs }),
+    });
+    if (!res.ok) throw new Error('Failed to add scenarios to suite');
+    return res.json();
+}
+
+export async function removeScenarioFromSuite(suiteId: string, scenarioId: string): Promise<{ status: string }> {
+    const res = await fetch(`${API_BASE}/test-suites/${suiteId}/scenarios/${scenarioId}`, {
+        method: 'DELETE',
+    });
+    if (!res.ok) throw new Error('Failed to remove scenario');
     return res.json();
 }
 
@@ -169,7 +196,7 @@ export async function deleteTestSuite(suiteId: string): Promise<{ status: string
     return res.json();
 }
 
-export async function runTestSuite(suiteId: string): Promise<{ status: string; suite_id: string; tests_count: number }> {
+export async function runTestSuite(suiteId: string): Promise<{ status: string; suite_id: string; run_ids: string[]; scenarios_count: number }> {
     const res = await fetch(`${API_BASE}/test-suites/${suiteId}/run`, {
         method: 'POST',
     });
@@ -559,6 +586,8 @@ export const api = {
     createTestSuite,
     getTestSuite,
     updateTestSuite,
+    addScenariosToSuite,
+    removeScenarioFromSuite,
     deleteTestSuite,
     runTestSuite,
 
