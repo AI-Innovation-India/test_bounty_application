@@ -1,0 +1,127 @@
+# Azure DevOps Pipeline — TestBounty AI Test Suite
+# Add this file to your repo root and create a pipeline from it in Azure DevOps.
+#
+# Required Variable Groups (Library > Variable Groups):
+#   testbounty-secrets:
+#     ANTHROPIC_API_KEY or AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_DEPLOYMENT
+#     APP_TEST_USERNAME, APP_TEST_PASSWORD
+#     SLACK_WEBHOOK_URL (optional)
+
+trigger:
+  branches:
+    include: [main, develop]
+  paths:
+    exclude: ['*.md', 'docs/**']
+
+pr:
+  branches:
+    include: [main]
+
+schedules:
+  - cron: '0 2 * * *'
+    displayName: Nightly Regression
+    branches:
+      include: [main]
+    always: true
+
+parameters:
+  - name: suiteType
+    displayName: Suite to run
+    type: string
+    default: regression
+    values: [smoke, regression, sanity]
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: testbounty-secrets
+  - name: pythonVersion
+    value: '3.11'
+  - name: testbountyDir
+    value: testbounty_agent
+
+stages:
+  - stage: AITests
+    displayName: TestBounty AI Tests
+    jobs:
+      - job: RunSuite
+        displayName: Run ${{ parameters.suiteType }} suite
+        timeoutInMinutes: 45
+
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: $(pythonVersion)
+            displayName: Setup Python
+
+          - script: |
+              pip install -r requirements.txt
+              playwright install chromium --with-deps
+            workingDirectory: $(testbountyDir)
+            displayName: Install dependencies
+
+          - script: |
+              python -m uvicorn src.api_server:app --host 0.0.0.0 --port 8000 &
+              for i in $(seq 1 30); do
+                curl -sf http://localhost:8000/api/skills && break || sleep 2
+              done
+              echo "TestBounty API ready"
+            workingDirectory: $(testbountyDir)
+            displayName: Start TestBounty API
+            env:
+              ANTHROPIC_API_KEY: $(ANTHROPIC_API_KEY)
+              AZURE_OPENAI_API_KEY: $(AZURE_OPENAI_API_KEY)
+              AZURE_OPENAI_ENDPOINT: $(AZURE_OPENAI_ENDPOINT)
+              AZURE_OPENAI_DEPLOYMENT: $(AZURE_OPENAI_DEPLOYMENT)
+
+          - script: |
+              # Run smoke on PRs, full regression on merges/schedule
+              if [ "$(Build.Reason)" = "PullRequest" ]; then
+                SUITE="Smoke"
+              else
+                SUITE="${{ parameters.suiteType }}"
+              fi
+
+              python -m src.cli run-suite "$SUITE" \
+                --api http://localhost:8000 \
+                --wait \
+                --fail-on-failure \
+                --timeout 1200 \
+                --junit $(Agent.TempDirectory)/testbounty-results.xml
+            workingDirectory: $(testbountyDir)
+            displayName: Run AI test suite
+            env:
+              TEST_USERNAME: $(APP_TEST_USERNAME)
+              TEST_PASSWORD: $(APP_TEST_PASSWORD)
+
+          - task: PublishTestResults@2
+            displayName: Publish test results
+            condition: always()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: '$(Agent.TempDirectory)/testbounty-results.xml'
+              testRunTitle: 'TestBounty AI Tests — ${{ parameters.suiteType }}'
+              failTaskOnFailedTests: true
+              mergeTestResults: true
+
+          - task: PublishPipelineArtifact@1
+            displayName: Upload artifacts
+            condition: always()
+            inputs:
+              targetPath: '$(testbountyDir)/temp_runs'
+              artifact: testbounty-runs-$(Build.BuildNumber)
+              publishLocation: pipeline
+
+          # Notify Teams on failure
+          - task: office365connector@0
+            displayName: Notify Teams on failure
+            condition: failed()
+            inputs:
+              webhookUrl: $(TEAMS_WEBHOOK_URL)
+              title: TestBounty suite failed
+              text: |
+                **Suite:** ${{ parameters.suiteType }}
+                **Branch:** $(Build.SourceBranchName)
+                **Triggered by:** $(Build.RequestedFor)
+                [View Pipeline]($(System.TeamFoundationCollectionUri)$(System.TeamProject)/_build/results?buildId=$(Build.BuildId))

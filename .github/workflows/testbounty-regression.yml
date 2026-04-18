@@ -1,0 +1,121 @@
+name: TestBounty Regression Suite
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run full regression nightly at 2am UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      suite_type:
+        description: 'Suite type to run'
+        required: false
+        default: 'regression'
+        type: choice
+        options: [regression, smoke, sanity]
+
+jobs:
+  testbounty:
+    name: AI Test Suite (${{ github.event.inputs.suite_type || 'regression' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Start TestBounty backend ─────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        working-directory: testbounty_agent
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Start TestBounty API
+        working-directory: testbounty_agent
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+        run: |
+          python -m uvicorn src.api_server:app --host 0.0.0.0 --port 8000 &
+          # Wait for API to be ready
+          for i in {1..30}; do
+            curl -sf http://localhost:8000/api/skills && break
+            sleep 2
+          done
+          echo "TestBounty API is ready"
+
+      # ── Run test suite ───────────────────────────────────────────────────────
+      - name: Run Smoke Suite (on PRs)
+        if: github.event_name == 'pull_request'
+        working-directory: testbounty_agent
+        env:
+          TEST_USERNAME: ${{ secrets.APP_TEST_USERNAME }}
+          TEST_PASSWORD: ${{ secrets.APP_TEST_PASSWORD }}
+        run: |
+          python -m src.cli run-suite "Smoke" \
+            --api http://localhost:8000 \
+            --wait \
+            --fail-on-failure \
+            --junit smoke-results.xml
+        continue-on-error: false
+
+      - name: Run Regression Suite (on push/schedule)
+        if: github.event_name != 'pull_request'
+        working-directory: testbounty_agent
+        env:
+          TEST_USERNAME: ${{ secrets.APP_TEST_USERNAME }}
+          TEST_PASSWORD: ${{ secrets.APP_TEST_PASSWORD }}
+        run: |
+          python -m src.cli run-suite "${{ github.event.inputs.suite_type || 'regression' }}" \
+            --api http://localhost:8000 \
+            --wait \
+            --fail-on-failure \
+            --timeout 1200 \
+            --junit regression-results.xml
+        continue-on-error: false
+
+      # ── Publish results ──────────────────────────────────────────────────────
+      - name: Publish JUnit Results
+        uses: mikepenz/action-junit-report@v4
+        if: always()
+        with:
+          report_paths: 'testbounty_agent/*-results.xml'
+          check_name: 'TestBounty AI Test Results'
+          fail_on_failure: true
+          annotate_only: false
+
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: testbounty-results-${{ github.run_number }}
+          path: |
+            testbounty_agent/*-results.xml
+            testbounty_agent/temp_runs/
+          retention-days: 30
+
+      # ── Notify on failure ────────────────────────────────────────────────────
+      - name: Notify Slack on failure
+        if: failure() && github.event_name != 'pull_request'
+        uses: 8398a7/action-slack@v3
+        with:
+          status: failure
+          text: |
+            TestBounty regression failed on `${{ github.ref_name }}`
+            Triggered by: ${{ github.actor }}
+            See: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

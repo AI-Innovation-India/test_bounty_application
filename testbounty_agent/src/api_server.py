@@ -352,6 +352,230 @@ async def get_run_artifact(run_id: str, filename: str):
 async def health_check():
     return {"status": "ok", "service": "TestSprite Agent API", "runs_stored": len(RUNS)}
 
+@app.get("/api/run/{run_id}/junit.xml", response_class=Response)
+async def export_junit_xml(run_id: str):
+    """
+    Export run results as JUnit XML — understood by Jenkins, GitHub Actions,
+    Azure DevOps, GitLab CI, and every major CI dashboard.
+    """
+    if run_id not in RUNS:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    run = RUNS[run_id]
+    results = run.get("results") or {}
+    suite_name = run.get("test_name", "TestBounty")
+    url = run.get("target_url", "")
+
+    tests = list(results.values()) if results else []
+    total = len(tests)
+    failures = sum(1 for t in tests if t.get("status") == "failed")
+    errors = sum(1 for t in tests if t.get("status") == "error")
+    passed = sum(1 for t in tests if t.get("status") == "passed")
+    skipped = total - passed - failures - errors
+
+    def esc(s: str) -> str:
+        return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<testsuites name="TestBounty" tests="{total}" failures="{failures}" errors="{errors}" skipped="{skipped}">',
+        f'  <testsuite name="{esc(suite_name)}" tests="{total}" failures="{failures}" errors="{errors}" skipped="{skipped}" hostname="{esc(url)}">',
+    ]
+
+    for scenario_id, r in results.items():
+        name = esc(r.get("name") or scenario_id)
+        module = esc(r.get("module") or "general")
+        status = r.get("status", "pending")
+        duration = r.get("duration_ms", 0) / 1000.0
+
+        lines.append(f'    <testcase classname="{module}" name="{name}" time="{duration:.3f}">')
+        if status == "failed":
+            err = esc(r.get("error") or "Scenario failed")
+            steps = r.get("steps_completed") or []
+            msg = esc(f"Failed after {len(steps)} steps. {r.get('error') or ''}")
+            lines.append(f'      <failure message="{msg}" type="AssertionError">{err}</failure>')
+        elif status == "error":
+            err = esc(r.get("error") or "Error")
+            lines.append(f'      <error message="{err}" type="Error">{err}</error>')
+        elif status in ("pending", "skipped"):
+            lines.append('      <skipped/>')
+        lines.append('    </testcase>')
+
+    lines += ["  </testsuite>", "</testsuites>"]
+    xml = "\n".join(lines)
+
+    return Response(content=xml, media_type="application/xml",
+                    headers={"Content-Disposition": f'attachment; filename="junit_{run_id[:8]}.xml"'})
+
+
+# =============================================================================
+# CI / CD TRIGGER — synchronous endpoint for pipelines
+# =============================================================================
+
+class CITriggerRequest(BaseModel):
+    suite_name: Optional[str] = None
+    suite_id: Optional[str] = None
+    suite_type: Optional[str] = None     # Run all suites of this type
+    timeout: int = 600                   # Max seconds to wait
+    fail_on_failure: bool = True         # HTTP 422 if any test fails
+    browser: str = "chromium"
+    credentials: Optional[Dict] = None  # {username, password}
+    webhook_url: Optional[str] = None   # Slack/Teams/custom webhook on failure
+
+@app.post("/api/ci/trigger")
+async def ci_trigger(request: CITriggerRequest):
+    """
+    Synchronous CI trigger — starts a suite run, waits for completion,
+    returns pass/fail result in one HTTP call.
+
+    Returns 200 if all passed, 422 if any failed (CI gate fails on non-2xx).
+
+    Example curl:
+        curl -X POST http://testbounty:8000/api/ci/trigger \\
+             -H 'Content-Type: application/json' \\
+             -d '{"suite_name":"Regression","timeout":300}'
+    """
+    # Resolve suite(s)
+    suites_to_run = []
+    if request.suite_id:
+        if request.suite_id not in TEST_SUITES:
+            raise HTTPException(status_code=404, detail=f"Suite not found: {request.suite_id}")
+        suites_to_run = [TEST_SUITES[request.suite_id]]
+    elif request.suite_name:
+        found = [s for s in TEST_SUITES.values() if s["name"].lower() == request.suite_name.lower()]
+        if not found:
+            raise HTTPException(status_code=404, detail=f"Suite not found: {request.suite_name}")
+        suites_to_run = found
+    elif request.suite_type:
+        suites_to_run = [s for s in TEST_SUITES.values() if s.get("suite_type") == request.suite_type]
+        if not suites_to_run:
+            raise HTTPException(status_code=404, detail=f"No suites with type: {request.suite_type}")
+    else:
+        raise HTTPException(status_code=400, detail="Provide suite_name, suite_id, or suite_type")
+
+    all_run_ids = []
+    for suite in suites_to_run:
+        refs = suite.get("scenario_refs") or []
+        if not refs:
+            continue
+        plan_groups: Dict[str, list] = {}
+        for ref in refs:
+            plan_groups.setdefault(ref["plan_id"], []).append(ref["scenario_id"])
+
+        for pid, sids in plan_groups.items():
+            if pid not in PLANS:
+                continue
+            plan = PLANS[pid]
+            scenarios_to_run = [
+                sc for mod in plan.get("test_plan", {}).get("modules", {}).values()
+                for sc in mod.get("scenarios", [])
+                if sc["id"] in sids
+            ]
+            if not scenarios_to_run:
+                continue
+            run_id = str(uuid.uuid4())
+            RUNS[run_id] = {
+                "id": run_id,
+                "plan_id": pid,
+                "type": "ci_run",
+                "target_url": plan["url"],
+                "test_name": f"CI: {suite['name']}",
+                "scenarios": scenarios_to_run,
+                "status": "pending",
+                "results": {},
+                "created_at": datetime.now().isoformat(),
+                "suite_id": suite["id"],
+            }
+            save_runs()
+            # Run synchronously in thread pool so we can await completion
+            loop = asyncio.get_event_loop()
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                await loop.run_in_executor(
+                    ex, run_scenarios_task_sync,
+                    run_id, plan["url"], scenarios_to_run, request.browser
+                )
+            all_run_ids.append(run_id)
+
+    if not all_run_ids:
+        raise HTTPException(status_code=400, detail="No runnable scenarios found in suite(s)")
+
+    # ── Aggregate results ─────────────────────────────────────────────────────
+    total = passed = failed = 0
+    failed_details = []
+    for run_id in all_run_ids:
+        run = RUNS.get(run_id, {})
+        for sid, r in (run.get("results") or {}).items():
+            total += 1
+            if r.get("status") == "passed":
+                passed += 1
+            else:
+                failed += 1
+                failed_details.append({
+                    "scenario": r.get("name") or sid,
+                    "error": r.get("error") or "failed",
+                    "steps_completed": len(r.get("steps_completed") or []),
+                })
+
+    pass_rate = (passed / total * 100) if total else 0
+    result_payload = {
+        "status": "passed" if failed == 0 else "failed",
+        "total": total,
+        "passed": passed,
+        "failed": failed,
+        "pass_rate": round(pass_rate, 1),
+        "run_ids": all_run_ids,
+        "suites_run": [s["name"] for s in suites_to_run],
+        "junit_urls": [f"/api/run/{rid}/junit.xml" for rid in all_run_ids],
+    }
+    if failed_details:
+        result_payload["failures"] = failed_details
+
+    # ── Webhook notification ──────────────────────────────────────────────────
+    if request.webhook_url and failed > 0:
+        _send_webhook(request.webhook_url, result_payload, suites_to_run)
+
+    if request.fail_on_failure and failed > 0:
+        raise HTTPException(status_code=422, detail=result_payload)
+
+    return result_payload
+
+
+def _send_webhook(webhook_url: str, result: dict, suites: list):
+    """Send Slack/Teams/custom webhook notification on failure."""
+    suite_names = ", ".join(s["name"] for s in suites)
+    failed = result.get("failed", 0)
+    total = result.get("total", 0)
+    failures_text = "\n".join(
+        f"• {f['scenario']}: {f['error'][:100]}"
+        for f in (result.get("failures") or [])[:5]
+    )
+
+    # Slack-compatible payload (also works for many other tools)
+    payload = {
+        "text": f":red_circle: TestBounty suite failed: *{suite_names}*",
+        "attachments": [{
+            "color": "danger",
+            "fields": [
+                {"title": "Result", "value": f"{failed}/{total} failed", "short": True},
+                {"title": "Pass Rate", "value": f"{result.get('pass_rate')}%", "short": True},
+                {"title": "Failed Scenarios", "value": failures_text or "see report", "short": False},
+            ],
+        }],
+    }
+    try:
+        import urllib.request as ur
+        req = ur.Request(
+            webhook_url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        ur.urlopen(req, timeout=5)
+    except Exception as e:
+        logger.warning(f"Webhook failed: {e}")
+
+
 @app.delete("/api/run/{run_id}")
 async def delete_run(run_id: str):
     """Delete a specific run and its artifacts."""
