@@ -30,7 +30,7 @@ interface AgentState {
 interface SessionEvent {
     id: string;
     type: "progress" | "screenshot" | "finding" | "warning" | "error"
-        | "question" | "agent_start" | "done" | "ping";
+        | "question" | "agent_start" | "done" | "analysis_complete" | "ping";
     agent: string;
     icon: string;
     message: string;
@@ -165,11 +165,16 @@ export default function AutonomousPage() {
                     setStatus("waiting_answer");
                 }
 
-                // Done
+                // Analysis complete — browser stays open, show summary
+                if (event.type === "analysis_complete") {
+                    setStatus("analysis_done");
+                    if (event.data) setSummary(event.data);
+                }
+
+                // Done (browser closed)
                 if (event.type === "done") {
                     setStatus("done");
                     sessionIdRef.current = null;
-                    if (event.data?.summary) setSummary(event.data.summary);
                 }
 
                 if (event.type === "error") setStatus("error");
@@ -224,6 +229,7 @@ export default function AutonomousPage() {
     };
 
     const isActive = status === "running" || status === "starting" || status === "waiting_answer";
+    const isSessionOpen = isActive || status === "analysis_done";
 
     // ── Render ─────────────────────────────────────────────────────────────────
 
@@ -265,6 +271,13 @@ export default function AutonomousPage() {
                                 )}
                             </div>
                         )}
+                        {status === "analysis_done" && (
+                            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-500/10 border border-emerald-500/30">
+                                <CheckCircle size={14} className="text-emerald-400" />
+                                <span className="text-xs font-semibold text-emerald-400">Analysis Complete</span>
+                                <span className="text-xs text-slate-500">Browser open · click Stop to close</span>
+                            </div>
+                        )}
                     </div>
 
                     {/* ── URL Input ─────────────────────────────────────────── */}
@@ -275,9 +288,9 @@ export default function AutonomousPage() {
                                     type="url"
                                     value={url}
                                     onChange={e => setUrl(e.target.value)}
-                                    onKeyDown={e => e.key === "Enter" && !isActive && handleStart()}
+                                    onKeyDown={e => e.key === "Enter" && !isSessionOpen && handleStart()}
                                     placeholder="https://any-web-application.com"
-                                    disabled={isActive}
+                                    disabled={isSessionOpen}
                                     className="flex-1 px-4 py-3 bg-[#1a1a1d] border border-white/10 rounded-lg text-white placeholder:text-slate-500 focus:outline-none focus:border-[#00D4AA]/50 disabled:opacity-50"
                                 />
                                 <div className="flex items-center gap-2 px-3 bg-[#1a1a1d] border border-white/10 rounded-lg">
@@ -286,18 +299,22 @@ export default function AutonomousPage() {
                                         type="number"
                                         value={maxPages}
                                         onChange={e => setMaxPages(Math.max(5, Math.min(50, +e.target.value)))}
-                                        disabled={isActive}
+                                        disabled={isSessionOpen}
                                         className="w-12 bg-transparent text-white text-sm text-center focus:outline-none disabled:opacity-50"
                                         min={5} max={50}
                                     />
                                 </div>
                             </div>
-                            {isActive ? (
+                            {isSessionOpen ? (
                                 <button
                                     onClick={handleStop}
-                                    className="px-6 py-3 bg-red-500/15 hover:bg-red-500/25 text-red-400 border border-red-500/30 font-semibold rounded-lg transition-colors flex items-center gap-2"
+                                    className={`px-6 py-3 font-semibold rounded-lg transition-colors flex items-center gap-2 ${
+                                        status === "analysis_done"
+                                            ? "bg-slate-700/50 hover:bg-slate-700 text-slate-300 border border-slate-600/50"
+                                            : "bg-red-500/15 hover:bg-red-500/25 text-red-400 border border-red-500/30"
+                                    }`}
                                 >
-                                    <Square size={16} /> Stop
+                                    <Square size={16} /> {status === "analysis_done" ? "Close Browser" : "Stop"}
                                 </button>
                             ) : (
                                 <button
@@ -389,7 +406,7 @@ export default function AutonomousPage() {
                     )}
 
                     {/* ── Main 3-column layout ─────────────────────────────── */}
-                    {(isActive || status === "done" || status === "error" || agents.length > 0) && (
+                    {(isSessionOpen || status === "done" || status === "error" || agents.length > 0) && (
                         <div className="grid grid-cols-[1fr_320px_300px] gap-5 flex-1">
 
                             {/* ── Col 1: Live Screenshot ─────────────────────── */}
@@ -525,8 +542,8 @@ export default function AutonomousPage() {
                                         );
                                     })}
 
-                                    {/* Done summary */}
-                                    {status === "done" && summary && (
+                                    {/* Done/analysis_done summary */}
+                                    {(status === "done" || status === "analysis_done") && summary && (
                                         <div className="mt-2 p-3 rounded-xl bg-[#00D4AA]/8 border border-[#00D4AA]/20 space-y-1.5">
                                             <p className="text-xs font-semibold text-[#00D4AA] flex items-center gap-1.5">
                                                 <CheckCircle size={12} /> Session Complete
@@ -587,13 +604,19 @@ export default function AutonomousPage() {
                                             <span>running…</span>
                                         </div>
                                     )}
+                                    {status === "analysis_done" && (
+                                        <div className="flex items-center gap-2 text-emerald-500 mt-1">
+                                            <CheckCircle size={10} />
+                                            <span>Analysis complete — browser open for inspection</span>
+                                        </div>
+                                    )}
                                 </div>
                             </div>
                         </div>
                     )}
 
                     {/* ── Findings panel (issues from landing page, warnings) ── */}
-                    {(status === "done" || (events.some(e => e.type === "finding" || e.type === "warning"))) && (
+                    {(status === "done" || status === "analysis_done" || (events.some(e => e.type === "finding" || e.type === "warning"))) && (
                         <div className="bg-[#121214] border border-white/5 rounded-xl p-5">
                             <h3 className="text-sm font-semibold text-white mb-3 flex items-center gap-2">
                                 <AlertCircle size={14} className="text-yellow-400" />
@@ -618,7 +641,7 @@ export default function AutonomousPage() {
                                             <span className="line-clamp-2">{e.message}</span>
                                         </div>
                                     ))}
-                                {events.filter(e => e.type === "warning").length === 0 && status === "done" && (
+                                {events.filter(e => e.type === "warning").length === 0 && (status === "done" || status === "analysis_done") && (
                                     <p className="text-xs text-slate-500 col-span-2">No issues detected.</p>
                                 )}
                             </div>

@@ -236,16 +236,10 @@ class AutonomousSession:
             self.status = "error"
             self.emit("error", "orchestrator", f"Session failed: {e}")
         finally:
-            if self.status not in ("error", "waiting_answer"):
+            if self.status not in ("error", "waiting_answer", "analysis_done"):
                 self.status = "done"
-            self._update_agent("orchestrator", status="done")
-            self.emit("done", "orchestrator",
-                      f"Session complete — {len(self.page_map)} pages explored",
-                      data={
-                          "page_count": len(self.page_map),
-                          "agent_count": len(self.agents),
-                          "summary": self.findings_summary,
-                      })
+            else:
+                self.status = "done"
 
     # ── Sync Playwright run (Windows compatible) ───────────────────────────────
 
@@ -413,7 +407,16 @@ class AutonomousSession:
                                            findings_count=len(self.page_map),
                                            current_task=f"Done — {len(self.page_map)} pages total")
 
-            # ── Keep browser open until user clicks Stop ────────────────────────
+            # ── Signal analysis is complete ────────────────────────────────────
+            self.status = "analysis_done"
+            self._update_agent("orchestrator", status="done",
+                                current_task=f"Done — {len(self.page_map)} pages, "
+                                             f"{len(self.agents)} agents")
+            self.emit("analysis_complete", "orchestrator",
+                      f"Analysis complete — {len(self.page_map)} pages explored, "
+                      f"{len(self.agents)} agents deployed",
+                      data=self.findings_summary)
+            # Keep browser open until user clicks Stop
             self.emit("progress", "orchestrator",
                       "Browser staying open for inspection — click Stop to close it")
             self._stop.wait()   # blocks until stop() is called (user clicks Stop)
