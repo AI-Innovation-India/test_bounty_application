@@ -860,3 +860,26 @@ export async function answerAutonomousQuestion(sessionId: string, answer: string
 export async function deleteAutonomousSession(sessionId: string): Promise<void> {
     await fetch(`${API_BASE}/autonomous/${sessionId}`, { method: 'DELETE' });
 }
+
+export async function getAutonomousScenarios(sessionId: string): Promise<{
+    scenarios: any[];
+    total: number;
+    by_feature: Record<string, any[]>;
+}> {
+    const res = await fetch(`${API_BASE}/autonomous/${sessionId}/scenarios`);
+    if (!res.ok) throw new Error('Failed to fetch scenarios');
+    return res.json();
+}
+
+export async function saveAutonomousScenarios(
+    sessionId: string,
+    suiteName?: string,
+): Promise<{ plan_id: string; suite_id: string | null; scenarios: number }> {
+    const res = await fetch(`${API_BASE}/autonomous/${sessionId}/save-scenarios`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ suite_name: suiteName }),
+    });
+    if (!res.ok) throw new Error('Failed to save scenarios');
+    return res.json();
+}

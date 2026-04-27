@@ -4,14 +4,15 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import Sidebar from "@/components/Sidebar";
 import {
     startAutonomousSession, answerAutonomousQuestion,
-    deleteAutonomousSession, WS_BASE,
+    deleteAutonomousSession, saveAutonomousScenarios, WS_BASE,
 } from "@/lib/api";
 import {
     Globe, Play, Square, Brain, CheckCircle, XCircle, AlertCircle,
     Loader2, ChevronDown, ChevronRight, Image, Link2, Type,
     Eye, Zap, Shield, Search, BarChart3, Bell, Settings2,
     ShoppingCart, Map, MessageSquare, Users, Bot, Sparkles,
-    X, Send, RefreshCw,
+    X, Send, RefreshCw, FlaskConical, Save, ExternalLink,
+    ListChecks, ChevronUp,
 } from "lucide-react";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -98,6 +99,10 @@ export default function AutonomousPage() {
     const [expandedAgents, setExpandedAgents] = useState<Set<string>>(new Set());
     const [summary, setSummary] = useState<any>(null);
     const [wsConnected, setWsConnected] = useState(false);
+    const [generatedScenarios, setGeneratedScenarios] = useState<Record<string, any[]>>({});
+    const [expandedScenario, setExpandedScenario] = useState<string | null>(null);
+    const [savingSuite, setSavingSuite] = useState(false);
+    const [savedSuite, setSavedSuite] = useState<{ planId: string; suiteId: string | null } | null>(null);
 
     const wsRef = useRef<WebSocket | null>(null);
     const eventLogRef = useRef<HTMLDivElement>(null);
@@ -150,6 +155,26 @@ export default function AutonomousPage() {
                     setAgents(event.agents_snapshot);
                 }
 
+                // Accumulate generated scenarios from finding events
+                if (event.type === "finding" && event.data?.scenario_id && event.data?.steps) {
+                    const feature = event.agent || "general";
+                    setGeneratedScenarios(prev => {
+                        const next = { ...prev };
+                        if (!next[feature]) next[feature] = [];
+                        // Avoid duplicates
+                        if (!next[feature].some((s: any) => s.id === event.data.scenario_id)) {
+                            next[feature] = [...next[feature], {
+                                id:     event.data.scenario_id,
+                                name:   event.message,
+                                passed: event.data.passed,
+                                total:  event.data.total,
+                                steps:  event.data.steps,
+                            }];
+                        }
+                        return next;
+                    });
+                }
+
                 // Update screenshot
                 if (event.screenshot) {
                     setScreenshot(event.screenshot);
@@ -191,6 +216,9 @@ export default function AutonomousPage() {
         setScreenshot(null);
         setPendingQuestion(null);
         setSummary(null);
+        setGeneratedScenarios({});
+        setSavedSuite(null);
+        setExpandedScenario(null);
         setStatus("starting");
 
         try {
@@ -228,6 +256,22 @@ export default function AutonomousPage() {
         }
     };
 
+    const handleSaveSuite = async () => {
+        if (!sessionId) return;
+        setSavingSuite(true);
+        try {
+            const domain = url.replace(/^https?:\/\//, "").split("/")[0];
+            const suiteName = `Autonomous — ${domain}`;
+            const res = await saveAutonomousScenarios(sessionId, suiteName);
+            setSavedSuite({ planId: res.plan_id, suiteId: res.suite_id });
+        } catch (_) {
+            alert("Failed to save scenarios");
+        } finally {
+            setSavingSuite(false);
+        }
+    };
+
+    const totalScenarios = Object.values(generatedScenarios).reduce((n, arr) => n + arr.length, 0);
     const isActive = status === "running" || status === "starting" || status === "waiting_answer";
     const isSessionOpen = isActive || status === "analysis_done";
 
@@ -546,17 +590,20 @@ export default function AutonomousPage() {
                                     {(status === "done" || status === "analysis_done") && summary && (
                                         <div className="mt-2 p-3 rounded-xl bg-[#00D4AA]/8 border border-[#00D4AA]/20 space-y-1.5">
                                             <p className="text-xs font-semibold text-[#00D4AA] flex items-center gap-1.5">
-                                                <CheckCircle size={12} /> Session Complete
+                                                <CheckCircle size={12} /> Analysis Complete
                                             </p>
                                             {[
-                                                ["Pages explored", summary.pages_explored],
-                                                ["Features found", summary.features_found],
-                                                ["Agents deployed", summary.agents_deployed],
-                                                ["Issues found", summary.total_issues],
+                                                ["Pages explored",     summary.pages_explored],
+                                                ["Features found",     summary.features_found],
+                                                ["Agents deployed",    summary.agents_deployed],
+                                                ["Test scenarios",     summary.scenarios_generated ?? totalScenarios],
+                                                ["Issues found",       summary.total_issues],
                                             ].map(([label, val]) => (
                                                 <div key={label as string} className="flex justify-between text-xs">
                                                     <span className="text-slate-400">{label}</span>
-                                                    <span className="text-white font-medium">{val}</span>
+                                                    <span className={`font-medium ${label === "Test scenarios" ? "text-violet-400" : "text-white"}`}>
+                                                        {val}
+                                                    </span>
                                                 </div>
                                             ))}
                                         </div>
@@ -645,6 +692,156 @@ export default function AutonomousPage() {
                                     <p className="text-xs text-slate-500 col-span-2">No issues detected.</p>
                                 )}
                             </div>
+                        </div>
+                    )}
+
+                    {/* ── Generated Test Cases panel ───────────────────────── */}
+                    {totalScenarios > 0 && (
+                        <div className="bg-[#121214] border border-white/5 rounded-xl overflow-hidden">
+                            {/* Header */}
+                            <div className="flex items-center justify-between px-5 py-4 border-b border-white/5">
+                                <div className="flex items-center gap-2">
+                                    <FlaskConical size={15} className="text-violet-400" />
+                                    <span className="text-sm font-semibold text-white">
+                                        Generated Test Cases
+                                    </span>
+                                    <span className="text-xs px-2 py-0.5 rounded-full bg-violet-500/15 text-violet-400 font-semibold">
+                                        {totalScenarios} scenarios
+                                    </span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    {savedSuite ? (
+                                        <div className="flex items-center gap-1.5 text-xs text-emerald-400 px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/20">
+                                            <CheckCircle size={12} />
+                                            Saved to Test Suites
+                                        </div>
+                                    ) : (
+                                        <button
+                                            onClick={handleSaveSuite}
+                                            disabled={savingSuite}
+                                            className="flex items-center gap-2 px-4 py-2 bg-violet-500/15 hover:bg-violet-500/25 border border-violet-500/30 text-violet-300 rounded-lg text-xs font-semibold transition-colors disabled:opacity-50"
+                                        >
+                                            {savingSuite ? (
+                                                <Loader2 size={12} className="animate-spin" />
+                                            ) : (
+                                                <Save size={12} />
+                                            )}
+                                            {savingSuite ? "Saving…" : "Save to Test Suites"}
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+
+                            {/* Feature groups */}
+                            <div className="divide-y divide-white/5">
+                                {Object.entries(generatedScenarios).map(([feature, scenarios]) => (
+                                    <div key={feature} className="p-4">
+                                        {/* Feature label */}
+                                        <div className="flex items-center gap-2 mb-3">
+                                            <span className="text-sm">
+                                                {AGENT_ICON_MAP[feature] || <Bot size={14} className="text-slate-400" />}
+                                            </span>
+                                            <span className="text-xs font-semibold text-slate-300 uppercase tracking-wider">
+                                                {feature.replace(/_/g, " ")}
+                                            </span>
+                                            <span className="text-xs text-slate-600">
+                                                {scenarios.length} scenario{scenarios.length !== 1 ? "s" : ""}
+                                            </span>
+                                        </div>
+
+                                        {/* Scenario cards */}
+                                        <div className="space-y-2">
+                                            {scenarios.map((sc: any) => {
+                                                const isExp = expandedScenario === sc.id;
+                                                const pct   = sc.total > 0 ? Math.round((sc.passed / sc.total) * 100) : 0;
+                                                const allPass = sc.passed === sc.total && sc.total > 0;
+                                                return (
+                                                    <div
+                                                        key={sc.id}
+                                                        className={`border rounded-lg overflow-hidden ${
+                                                            allPass
+                                                                ? "border-emerald-500/20 bg-emerald-500/3"
+                                                                : sc.passed > 0
+                                                                ? "border-yellow-500/20 bg-yellow-500/3"
+                                                                : "border-white/8 bg-[#0f0f11]"
+                                                        }`}
+                                                    >
+                                                        {/* Row */}
+                                                        <div
+                                                            className="flex items-center gap-3 px-3 py-2.5 cursor-pointer hover:bg-white/5"
+                                                            onClick={() => setExpandedScenario(isExp ? null : sc.id)}
+                                                        >
+                                                            {isExp
+                                                                ? <ChevronUp size={12} className="text-slate-500 shrink-0" />
+                                                                : <ChevronDown size={12} className="text-slate-500 shrink-0" />}
+
+                                                            <ListChecks size={13} className={allPass ? "text-emerald-400" : "text-slate-500"} />
+
+                                                            <span className="flex-1 text-xs font-medium text-white truncate">
+                                                                {sc.name.replace(/^\[AUTO\]\s*/, "")}
+                                                            </span>
+
+                                                            {/* Pass rate bar */}
+                                                            <div className="flex items-center gap-2 shrink-0">
+                                                                <div className="w-16 h-1.5 rounded-full bg-white/10 overflow-hidden">
+                                                                    <div
+                                                                        className={`h-full rounded-full transition-all ${allPass ? "bg-emerald-400" : "bg-yellow-400"}`}
+                                                                        style={{ width: `${pct}%` }}
+                                                                    />
+                                                                </div>
+                                                                <span className={`text-xs font-medium ${allPass ? "text-emerald-400" : "text-yellow-400"}`}>
+                                                                    {sc.passed}/{sc.total}
+                                                                </span>
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Steps expansion */}
+                                                        {isExp && sc.steps?.length > 0 && (
+                                                            <div className="border-t border-white/5 px-3 pb-3 pt-2 space-y-1">
+                                                                {sc.steps.map((step: any, i: number) => (
+                                                                    <div key={i} className="flex items-start gap-2 text-xs">
+                                                                        <span className={`mt-0.5 shrink-0 font-mono px-1.5 py-0.5 rounded text-[10px] ${
+                                                                            step.action === "click"          ? "bg-blue-500/15 text-blue-400" :
+                                                                            step.action === "fill"           ? "bg-orange-500/15 text-orange-400" :
+                                                                            step.action === "assert_visible" ? "bg-emerald-500/15 text-emerald-400" :
+                                                                            step.action === "assert_text"    ? "bg-teal-500/15 text-teal-400" :
+                                                                            step.action === "navigate"       ? "bg-indigo-500/15 text-indigo-400" :
+                                                                            "bg-slate-500/15 text-slate-400"
+                                                                        }`}>
+                                                                            {step.action}
+                                                                        </span>
+                                                                        <span className="text-slate-400 flex-1">
+                                                                            {step.description}
+                                                                        </span>
+                                                                        {step.value && (
+                                                                            <span className="text-slate-600 font-mono">= "{step.value}"</span>
+                                                                        )}
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                );
+                                            })}
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+
+                            {/* Footer hint */}
+                            {savedSuite && (
+                                <div className="px-5 py-3 border-t border-white/5 flex items-center justify-between">
+                                    <span className="text-xs text-slate-500">
+                                        Plan ID: <span className="font-mono text-slate-400">{savedSuite.planId}</span>
+                                    </span>
+                                    <a
+                                        href="/test-lists"
+                                        className="flex items-center gap-1.5 text-xs text-violet-400 hover:text-violet-300 transition-colors"
+                                    >
+                                        Open in Test Suites <ExternalLink size={11} />
+                                    </a>
+                                </div>
+                            )}
                         </div>
                     )}
 

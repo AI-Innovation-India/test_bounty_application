@@ -3380,6 +3380,86 @@ async def delete_autonomous_session(session_id: str):
     return {"status": "deleted"}
 
 
+@app.get("/api/autonomous/{session_id}/scenarios")
+async def get_autonomous_scenarios(session_id: str):
+    """Return the test scenarios generated so far by this session."""
+    session = AUTONOMOUS_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {
+        "session_id":  session_id,
+        "scenarios":   session.generated_scenarios,
+        "total":       len(session.generated_scenarios),
+        "by_feature":  _group_scenarios_by_feature(session.generated_scenarios),
+    }
+
+
+class SaveScenariosRequest(BaseModel):
+    suite_name: Optional[str] = None   # if provided, also creates a test suite
+
+
+@app.post("/api/autonomous/{session_id}/save-scenarios")
+async def save_autonomous_scenarios(session_id: str, body: SaveScenariosRequest):
+    """
+    Persist generated scenarios into test_plans.json (and optionally test_suites.json).
+    Returns plan_id and suite_id.
+    """
+    from src.agents.scenario_writer import save_scenarios_as_plan
+
+    session = AUTONOMOUS_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if not session.generated_scenarios:
+        raise HTTPException(status_code=400, detail="No scenarios generated yet")
+
+    result = save_scenarios_as_plan(
+        session_id=session_id,
+        base_url=session.url,
+        scenarios=session.generated_scenarios,
+        suite_name=body.suite_name,
+    )
+
+    # Also keep in global PLANS so the existing /api/plans endpoint sees it
+    plan_id = result["plan_id"]
+    if plan_id not in PLANS:
+        PLANS[plan_id] = {
+            "id":         plan_id,
+            "url":        session.url,
+            "status":     "complete",
+            "source":     "autonomous",
+            "created_at": datetime.now().isoformat(),
+            "test_plan": {
+                "scenarios":    session.generated_scenarios,
+                "generated_at": datetime.now().isoformat(),
+                "total":        len(session.generated_scenarios),
+            },
+        }
+        save_plans(PLANS)
+
+    return {
+        "status":     "saved",
+        "plan_id":    result["plan_id"],
+        "suite_id":   result["suite_id"],
+        "scenarios":  len(session.generated_scenarios),
+    }
+
+
+def _group_scenarios_by_feature(scenarios: list) -> dict:
+    groups: dict = {}
+    for s in scenarios:
+        feat = s.get("module", "general")
+        if feat not in groups:
+            groups[feat] = []
+        groups[feat].append({
+            "id":     s["id"],
+            "name":   s["name"],
+            "passed": s.get("autonomous_meta", {}).get("steps_passed", 0),
+            "total":  s.get("autonomous_meta", {}).get("steps_total", 0),
+            "steps":  s.get("steps", []),
+        })
+    return groups
+
+
 @app.websocket("/ws/autonomous/{session_id}")
 async def autonomous_websocket(websocket: WebSocket, session_id: str):
     """

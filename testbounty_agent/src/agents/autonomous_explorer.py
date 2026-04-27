@@ -99,11 +99,12 @@ class AutonomousSession:
         self.session_id = session_id
         self.url = url.rstrip("/")
         self.domain = urlparse(url).netloc
-        self.status = "starting"   # starting | running | waiting_answer | done | error
+        self.status = "starting"   # starting | running | waiting_answer | analysis_done | done | error
         self.agents: List[Dict] = []
         self.events: List[Dict] = []
         self.page_map: Dict[str, Any] = {}
         self.findings_summary: Dict[str, Any] = {}
+        self.generated_scenarios: List[Dict] = []   # Filled by FeatureTestAgent
 
         # Answer synchronization (threading.Event for sync Playwright thread)
         self._answer_event = threading.Event()
@@ -411,11 +412,14 @@ class AutonomousSession:
             self.status = "analysis_done"
             self._update_agent("orchestrator", status="done",
                                 current_task=f"Done — {len(self.page_map)} pages, "
-                                             f"{len(self.agents)} agents")
+                                             f"{len(self.agents)} agents, "
+                                             f"{len(self.generated_scenarios)} scenarios")
+            self.findings_summary["scenarios_generated"] = len(self.generated_scenarios)
             self.emit("analysis_complete", "orchestrator",
-                      f"Analysis complete — {len(self.page_map)} pages explored, "
-                      f"{len(self.agents)} agents deployed",
-                      data=self.findings_summary)
+                      f"Analysis complete — {len(self.page_map)} pages, "
+                      f"{len(self.generated_scenarios)} test scenarios generated",
+                      data={**self.findings_summary,
+                            "scenarios_generated": len(self.generated_scenarios)})
             # Keep browser open until user clicks Stop
             self.emit("progress", "orchestrator",
                       "Browser staying open for inspection — click Stop to close it")
@@ -660,72 +664,60 @@ class AutonomousSession:
                 self.emit("warning", "orchestrator", f"Skipped {clean[:50]}: {e}")
         return pages
 
-    # ── Feature agent ──────────────────────────────────────────────────────────
+    # ── Feature agent — Claude-powered interactive testing ─────────────────────
 
     def _run_feature_agent(self, page, fname: str,
                             fpages: List[Dict]) -> List[str]:
+        """
+        Runs a FeatureTestAgent for this feature:
+          1. Asks a smart context question if configured
+          2. Calls Claude to analyze each page and generate test flows
+          3. Executes flows in the live browser
+          4. Stores generated scenarios on the session
+        Returns a list of finding strings (for backward compat with the caller).
+        """
+        from src.agents.feature_test_agent import FeatureTestAgent
+
         display = fname.replace("_", " ").title()
         self.emit("progress", fname,
-                  f"Reviewing {len(fpages)} page(s) for {display}…")
-        findings: List[str] = []
+                  f"Starting {display} — {len(fpages)} page(s) to test")
 
-        # Ask a smart question if we have one configured
+        # ── Optional: ask a context question before testing ──────────────────
         questions = _AGENT_QUESTIONS.get(fname, [])
+        user_context: Optional[str] = None
         if questions:
             q = questions[0]
             answer = self.ask_user_sync(fname, q["q"], q["opts"])
-            findings.append(f"User context: {answer}")
-            self.emit("progress", fname, f"Got answer: {answer}")
+            user_context = answer
+            self.emit("progress", fname, f"User context: {answer}")
 
-        for fp in fpages[:3]:
-            try:
-                _safe_goto(page, fp["url"], self.emit, timeout=20000)
+        # ── Run the feature test agent ────────────────────────────────────────
+        agent = FeatureTestAgent(
+            feature_name=fname,
+            pages=fpages,
+            session_id=self.session_id,
+            base_url=self.url,
+            emit_fn=self.emit,
+        )
+        scenarios = agent.run(page)
 
-                ss = _capture_screenshot(page)
-                self.emit("screenshot", fname,
-                          f"Reviewing: {fp['title'][:40]}", screenshot=ss)
+        # Store on session for API retrieval
+        self.generated_scenarios.extend(scenarios)
 
-                elements = fp.get("elements", [])
-                buttons = [e for e in elements
-                           if e["tag"] == "button" or e.get("type") in ("submit", "button")]
-                inputs = [e for e in elements
-                          if e["tag"] in ("input", "textarea", "select")]
+        # Build findings list for the orchestrator summary
+        findings: List[str] = []
+        if user_context:
+            findings.append(f"User context: {user_context}")
+        for sc in scenarios:
+            meta = sc.get("autonomous_meta", {})
+            passed = meta.get("steps_passed", 0)
+            total  = meta.get("steps_total", 0)
+            findings.append(
+                f"{sc['name']}: {passed}/{total} steps passed"
+            )
 
-                # Check for existing error indicators
-                try:
-                    error_count = page.eval_on_selector_all(
-                        ".error,.alert-danger,[role='alert'],.validation-error",
-                        "els => els.filter(e => e.offsetParent !== null).length",
-                    )
-                    if error_count:
-                        findings.append(
-                            f"{fp['title'][:30]}: {error_count} error indicator(s) visible on load"
-                        )
-                        self.emit("warning", fname,
-                                  f"Error indicators on {fp['title'][:30]}")
-                except Exception:
-                    pass
-
-                if inputs:
-                    finding = (f"{fp['title'][:30]}: {len(inputs)} input(s) — "
-                               f"{', '.join(i['name'] or i['type'] for i in inputs[:3])}")
-                    findings.append(finding)
-                if buttons:
-                    btn_labels = [b["text"] for b in buttons[:3] if b["text"]]
-                    finding = (f"{fp['title'][:30]}: {len(buttons)} button(s) — "
-                               f"{', '.join(btn_labels)}")
-                    findings.append(finding)
-
-                self.emit("finding", fname,
-                          f"{fp['title'][:40]}: {len(elements)} elements",
-                          data={"url": fp["url"], "inputs": len(inputs),
-                                "buttons": len(buttons)})
-
-            except Exception as e:
-                self.emit("warning", fname,
-                          f"Could not analyse {fp['url'][:40]}: {e}")
-
-        self.emit("progress", fname, f"{display} Agent done — {len(findings)} finding(s)")
+        self.emit("progress", fname,
+                  f"{display} complete — {len(scenarios)} scenario(s) generated")
         return findings
 
 
