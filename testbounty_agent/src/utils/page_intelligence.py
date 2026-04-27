@@ -436,9 +436,40 @@ def _call_vision_openai(screenshot_bytes: bytes, prompt: str) -> Optional[dict]:
     return None
 
 
+def _call_vision_azure(screenshot_bytes: bytes, prompt: str) -> Optional[dict]:
+    """Call Azure OpenAI vision API."""
+    import os, json as _json, base64
+    try:
+        from openai import AzureOpenAI
+        client = AzureOpenAI(
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+        )
+        deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+        b64 = base64.standard_b64encode(screenshot_bytes).decode("utf-8")
+        resp = client.chat.completions.create(
+            model=deployment,
+            max_tokens=256,
+            messages=[{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"}},
+                {"type": "text", "text": prompt},
+            ]}],
+        )
+        content = resp.choices[0].message.content.strip().replace("```json", "").replace("```", "").strip()
+        return _json.loads(content)
+    except Exception as e:
+        print(f"[Vision/Azure] {e}")
+    return None
+
+
 def _vision_call(screenshot_bytes: bytes, prompt: str) -> Optional[dict]:
-    """Try each available vision provider in order."""
+    """Try each available vision provider in order: Azure → Anthropic → Gemini → OpenAI."""
     import os
+    if os.getenv("AZURE_OPENAI_ENDPOINT") and os.getenv("AZURE_OPENAI_API_KEY"):
+        result = _call_vision_azure(screenshot_bytes, prompt)
+        if result:
+            return result
     if os.getenv("ANTHROPIC_API_KEY"):
         result = _call_vision_anthropic(screenshot_bytes, prompt)
         if result:

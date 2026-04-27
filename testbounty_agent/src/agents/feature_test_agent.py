@@ -1,10 +1,15 @@
 """
-FeatureTestAgent — Claude-powered interactive tester for one app feature.
+FeatureTestAgent — AI-powered interactive tester for one app feature.
+
+LLM provider priority (first available wins):
+  1. Azure OpenAI  — AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_KEY
+  2. Anthropic     — ANTHROPIC_API_KEY
+  3. OpenAI        — OPENAI_API_KEY
 
 Flow per feature:
   1. Navigate to each feature page
   2. Capture screenshot + DOM element inventory
-  3. Call Claude (vision + text) → structured test flows
+  3. Call LLM (vision + text) → structured test flows
   4. Execute each flow step in the live Playwright browser
   5. Record pass/fail per step with screenshots
   6. Return as Scenario objects ready for the test runner
@@ -168,6 +173,108 @@ def _build_user_prompt(
     )
 
 
+def _detect_llm_provider() -> str:
+    """Return the first available LLM provider based on env vars."""
+    if os.getenv("AZURE_OPENAI_ENDPOINT") and os.getenv("AZURE_OPENAI_API_KEY"):
+        return "azure"
+    if os.getenv("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    if os.getenv("OPENAI_API_KEY"):
+        return "openai"
+    return "none"
+
+
+def _call_llm_for_test_plan(
+    system_prompt: str,
+    user_prompt: str,
+    ss_b64: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Call the first available LLM provider with vision + text.
+    Returns raw text response or None on failure.
+
+    Provider order: Azure OpenAI → Anthropic → OpenAI
+    """
+    provider = _detect_llm_provider()
+
+    # ── Azure OpenAI ───────────────────────────────────────────────────────────
+    if provider == "azure":
+        try:
+            from openai import AzureOpenAI
+            client = AzureOpenAI(
+                azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+                api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+                api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01"),
+            )
+            deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+            content: List[Dict] = []
+            if ss_b64:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{ss_b64}", "detail": "high"},
+                })
+            content.append({"type": "text", "text": user_prompt})
+            resp = client.chat.completions.create(
+                model=deployment,
+                max_tokens=2048,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": content},
+                ],
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            print(f"[FeatureTestAgent/Azure] {e}")
+
+    # ── Anthropic Claude ───────────────────────────────────────────────────────
+    elif provider == "anthropic":
+        try:
+            import anthropic
+            client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+            content_blocks: List[Dict] = []
+            if ss_b64:
+                content_blocks.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": ss_b64},
+                })
+            content_blocks.append({"type": "text", "text": user_prompt})
+            resp = client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=2048,
+                system=system_prompt,
+                messages=[{"role": "user", "content": content_blocks}],
+            )
+            return resp.content[0].text
+        except Exception as e:
+            print(f"[FeatureTestAgent/Anthropic] {e}")
+
+    # ── OpenAI ─────────────────────────────────────────────────────────────────
+    elif provider == "openai":
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            content: List[Dict] = []
+            if ss_b64:
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{ss_b64}", "detail": "high"},
+                })
+            content.append({"type": "text", "text": user_prompt})
+            resp = client.chat.completions.create(
+                model="gpt-4o",
+                max_tokens=2048,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": content},
+                ],
+            )
+            return resp.choices[0].message.content
+        except Exception as e:
+            print(f"[FeatureTestAgent/OpenAI] {e}")
+
+    return None
+
+
 class FeatureTestAgent:
     """
     One agent per discovered feature.  Receives the list of pages belonging
@@ -194,6 +301,13 @@ class FeatureTestAgent:
 
     def run(self, page) -> List[Dict]:
         """Analyze + interact + return scenarios. Called from sync Playwright thread."""
+        provider = _detect_llm_provider()
+        if provider == "none":
+            self.emit("warning", self.feature,
+                      "Skipping — no LLM API key set (AZURE_OPENAI_API_KEY / "
+                      "ANTHROPIC_API_KEY / OPENAI_API_KEY)")
+            return []
+
         pages_to_test = self.pages[:3]   # Cap at 3 pages per feature
 
         for fp in pages_to_test:
@@ -234,11 +348,22 @@ class FeatureTestAgent:
 
         return self.scenarios
 
-    # ── Claude page analysis ───────────────────────────────────────────────────
+    # ── LLM page analysis (Azure / Anthropic / OpenAI) ────────────────────────
 
     def _analyze_page_with_claude(self, page, fp: Dict) -> List[Dict]:
-        """Navigate to page, capture state, call Claude, return flow list."""
-        import anthropic
+        """Navigate to page, capture state, call LLM, return flow list."""
+        provider = _detect_llm_provider()
+        if provider == "none":
+            self.emit("warning", self.feature,
+                      "No LLM API key configured. Set AZURE_OPENAI_API_KEY, "
+                      "ANTHROPIC_API_KEY, or OPENAI_API_KEY in .env")
+            return []
+
+        provider_label = {
+            "azure":     f"Azure OpenAI ({os.getenv('AZURE_OPENAI_DEPLOYMENT','gpt-4o')})",
+            "anthropic": "Claude (claude-sonnet-4-6)",
+            "openai":    "OpenAI (gpt-4o)",
+        }.get(provider, provider)
 
         # Navigate
         try:
@@ -247,10 +372,10 @@ class FeatureTestAgent:
         except Exception:
             pass
 
-        # Screenshot for Claude vision
+        # Screenshot for vision analysis
         ss_b64: Optional[str] = None
         try:
-            raw = page.screenshot(type="jpeg", quality=65, full_page=False)
+            raw   = page.screenshot(type="jpeg", quality=65, full_page=False)
             ss_b64 = base64.standard_b64encode(raw).decode()
             self.emit("screenshot", self.feature,
                       f"Analyzing: {fp.get('title','')[:40]}", screenshot=ss_b64)
@@ -287,45 +412,26 @@ class FeatureTestAgent:
         )
 
         self.emit("progress", self.feature,
-                  f"Calling Claude to generate test plan for {fp.get('title','')[:30]}…")
+                  f"[{provider_label}] Generating test plan for '{fp.get('title','')[:25]}'…")
+
+        raw_text = _call_llm_for_test_plan(_SYSTEM_PROMPT, user_prompt, ss_b64)
+        if not raw_text:
+            self.emit("warning", self.feature,
+                      f"LLM returned no response for {fp.get('title','?')[:30]}")
+            return []
 
         try:
-            client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-
-            content_blocks: List[Dict] = []
-            if ss_b64:
-                content_blocks.append({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "image/jpeg",
-                        "data": ss_b64,
-                    },
-                })
-            content_blocks.append({"type": "text", "text": user_prompt})
-
-            resp = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=2048,
-                system=_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": content_blocks}],
-            )
-            raw_text = resp.content[0].text.strip()
-            # Strip any accidental markdown fences
-            raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text, flags=re.M)
-            raw_text = re.sub(r"\s*```\s*$", "", raw_text, flags=re.M)
-            data  = json.loads(raw_text)
+            # Strip accidental markdown fences
+            clean = re.sub(r"^```(?:json)?\s*", "", raw_text.strip(), flags=re.M)
+            clean = re.sub(r"\s*```\s*$", "", clean, flags=re.M)
+            data  = json.loads(clean)
             flows = data.get("flows", [])
             self.emit("progress", self.feature,
                       f"Generated {len(flows)} flow(s) for '{fp.get('title','')[:25]}'")
             return flows
-
         except json.JSONDecodeError as je:
             self.emit("warning", self.feature,
-                      f"Claude returned invalid JSON: {str(je)[:60]}")
-        except Exception as e:
-            self.emit("warning", self.feature,
-                      f"Claude analysis failed: {str(e)[:80]}")
+                      f"LLM returned invalid JSON: {str(je)[:60]}")
         return []
 
     # ── Flow execution ─────────────────────────────────────────────────────────
