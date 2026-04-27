@@ -8,7 +8,10 @@ import {
     sendChatMessage, getChatHistory, applyChatKnowledge,
     startSessionRecord, getSessionRecord, stopSessionRecord,
     getActiveSkills, addScenariosToSuite,
-    type ChatMessage, type TestSuite, type ScenarioRef
+    createPlanAgents, listPlanAgents, answerAgentQuestion, skipAgentQuestion,
+    generateAgentScenarios, generateAllAgentScenarios, mergeAgentScenarios, runAgentScenarios,
+    feedAgentKnowledge, feedAllAgents,
+    type ChatMessage, type TestSuite, type ScenarioRef, type ModuleAgent, type AgentQuestion
 } from "@/lib/api";
 import {
     Search, Play, CheckCircle, XCircle, Clock, ChevronDown, ChevronRight,
@@ -36,8 +39,8 @@ interface Plan {
 }
 interface RunResult { id: string; name: string; status: string; steps_completed: string[]; error?: string; }
 
-// KT tab types
-type KtTab = "basic" | "stories" | "document" | "chat" | "record";
+// Panel tab types  (4 focused tabs instead of 6 confusing ones)
+type KtTab = "agents" | "train" | "chat" | "record";
 
 // ─── Component ────────────────────────────────────────────────────────────────
 
@@ -57,9 +60,9 @@ export default function ScenariosPage() {
     const [activePlanId, setActivePlanId] = useState<string | null>(null);
     const [exploringStatus, setExploringStatus] = useState("exploring");
 
-    // KT panel
-    const [showKtPanel, setShowKtPanel] = useState(false);
-    const [ktTab, setKtTab] = useState<KtTab>("basic");
+    // Builder panel
+    const [showKtPanel, setShowKtPanel] = useState(true);
+    const [ktTab, setKtTab] = useState<KtTab>("agents");
 
     // Basic KT
     const [appDescription, setAppDescription] = useState("");
@@ -89,11 +92,36 @@ export default function ScenariosPage() {
     const [recordingSessionId, setRecordingSessionId] = useState<string | null>(null);
     const [recordingStatus, setRecordingStatus] = useState<string>("idle");
     const [recordingEvents, setRecordingEvents] = useState(0);
+    const [recordingPaused, setRecordingPaused] = useState(false);
     const [startingRecord, setStartingRecord] = useState(false);
     const [stoppingRecord, setStoppingRecord] = useState(false);
 
+    // Test Credentials — stored only in memory, never persisted, never sent to AI
+    const [credModalOpen, setCredModalOpen] = useState(false);
+    const [credUsername, setCredUsername] = useState("");
+    const [credPassword, setCredPassword] = useState("");
+    const [credShowPassword, setCredShowPassword] = useState(false);
+    const [pendingRunAction, setPendingRunAction] = useState<null | (() => Promise<void>)>(null);
+
     // Active Skills
     const [activeSkills, setActiveSkills] = useState<string[]>([]);
+
+    // Multi-Agent System
+    const [agents, setAgents] = useState<ModuleAgent[]>([]);
+    const [agentsLoading, setAgentsLoading] = useState(false);
+    const [agentsGenerating, setAgentsGenerating] = useState(false);
+    const [agentsMerging, setAgentsMerging] = useState(false);
+    const [agentsRunning, setAgentsRunning] = useState(false);
+    const [agentAnswers, setAgentAnswers] = useState<Record<string, string>>({});
+    const [expandedAgents, setExpandedAgents] = useState<Set<string>>(new Set());
+    // Per-agent knowledge feeding
+    const [agentFeedTexts, setAgentFeedTexts] = useState<Record<string, string>>({});
+    const [agentFeedLoading, setAgentFeedLoading] = useState<Record<string, boolean>>({});
+    const [agentFeedExpanded, setAgentFeedExpanded] = useState<Set<string>>(new Set());
+    // Train AI → auto-route to agents
+    const [routeToAgents, setRouteToAgents] = useState(true);
+    // Heal summary from last run
+    const [healSummary, setHealSummary] = useState<{ total_healed: number; heals: any[] } | null>(null);
 
     // Shadow Mode standalone URL
     const [recordUrl, setRecordUrl] = useState<string>("");
@@ -131,6 +159,7 @@ export default function ScenariosPage() {
             try {
                 const s = await getSessionRecord(recordingSessionId);
                 setRecordingEvents(s.events_count);
+                setRecordingPaused(s.recording_paused || false);
                 if (s.status !== "recording") { setRecordingStatus(s.status); clearInterval(iv); }
             } catch (_) {}
         }, 1500);
@@ -145,6 +174,14 @@ export default function ScenariosPage() {
             .catch(() => setActiveSkills([]));
     }, [selectedPlan?.id, selectedPlan?.app_knowledge]);
 
+    // ── Auto-load agents when plan is selected ─────────────────────────────────
+    useEffect(() => {
+        if (!selectedPlan?.id) { setAgents([]); return; }
+        listPlanAgents(selectedPlan.id)
+            .then(r => setAgents(r.agents))
+            .catch(() => setAgents([]));
+    }, [selectedPlan?.id]);
+
     // ── Data helpers ──────────────────────────────────────────────────────────
 
     const fetchPlans = async () => {
@@ -155,7 +192,8 @@ export default function ScenariosPage() {
                 const ready = data.find((p: Plan) => p.status === "ready");
                 if (ready && !selectedPlan) {
                     setSelectedPlan(ready);
-                    if (ready.test_plan?.modules) setExpandedModules(new Set(Object.keys(ready.test_plan.modules)));
+                    // Start collapsed — user expands what they need
+                    setExpandedModules(new Set());
                 }
             }
         } catch (e) { console.error(e); }
@@ -217,7 +255,7 @@ export default function ScenariosPage() {
                     clearInterval(iv);
                     setSelectedPlan(plan); setActivePlanId(null);
                     setPlans(prev => [...prev.filter(p => p.id !== plan.id), plan]);
-                    if (plan.test_plan?.modules) setExpandedModules(new Set(Object.keys(plan.test_plan.modules)));
+                    setExpandedModules(new Set()); // collapsed — user expands what they need
                     setExploring(false);
                     setShowKtPanel(true); // auto-open KT panel after explore
                     setToast({ message: `Found ${plan.test_plan?.total_scenarios || 0} scenarios! Enhance with KT below.`, type: "success" });
@@ -239,7 +277,15 @@ export default function ScenariosPage() {
         try {
             const result = await importStories(selectedPlan.id, storiesText, storiesFormat);
             await reloadPlan(selectedPlan.id);
-            setToast({ message: `Added ${result.scenarios_added} scenarios from user stories!`, type: "success" });
+            // Also route to agents if the toggle is on and agents exist
+            if (routeToAgents && agents.length > 0) {
+                const routing = await feedAllAgents(selectedPlan.id, storiesText, "user_story");
+                const routed = routing.routed_to?.map((r: any) => r.display_name).join(", ");
+                setToast({ message: `+${result.scenarios_added} scenarios added. Agents trained: ${routed || "none"}`, type: "success" });
+                await loadAgents(selectedPlan.id);
+            } else {
+                setToast({ message: `Added ${result.scenarios_added} scenarios from user stories!`, type: "success" });
+            }
             setStoriesText("");
         } catch (e) { setToast({ message: "Failed to import stories", type: "error" }); }
         finally { setImportingStories(false); }
@@ -261,7 +307,24 @@ export default function ScenariosPage() {
         try {
             const result = await importDocument(selectedPlan.id, docFile);
             await reloadPlan(selectedPlan.id);
-            setToast({ message: `Extracted ${result.extracted_chars.toLocaleString()} chars → added ${result.scenarios_added} scenarios!`, type: "success" });
+            // Route document text to agents if toggle is on (best-effort for text files)
+            if (routeToAgents && agents.length > 0) {
+                try {
+                    const fileText = await docFile.text();
+                    if (fileText.length > 20) {
+                        const routing = await feedAllAgents(selectedPlan.id, fileText.slice(0, 6000), "document");
+                        const routed = routing.routed_to?.map((r: any) => r.display_name).join(", ");
+                        setToast({ message: `Doc parsed → +${result.scenarios_added} scenarios. Agents trained: ${routed || "none"}`, type: "success" });
+                        await loadAgents(selectedPlan.id);
+                    } else {
+                        setToast({ message: `Extracted ${result.extracted_chars.toLocaleString()} chars → added ${result.scenarios_added} scenarios!`, type: "success" });
+                    }
+                } catch (_) {
+                    setToast({ message: `Extracted ${result.extracted_chars.toLocaleString()} chars → added ${result.scenarios_added} scenarios!`, type: "success" });
+                }
+            } else {
+                setToast({ message: `Extracted ${result.extracted_chars.toLocaleString()} chars → added ${result.scenarios_added} scenarios!`, type: "success" });
+            }
             setDocFile(null);
         } catch (e) { setToast({ message: "Failed to import document", type: "error" }); }
         finally { setUploadingDoc(false); }
@@ -395,60 +458,94 @@ export default function ScenariosPage() {
         finally { setAddingToSuite(false); }
     };
 
+    // ── Credential gate — shows modal then executes the pending run action ───────
+    const askCredentialsThen = (action: () => Promise<void>) => {
+        setPendingRunAction(() => action);
+        setCredModalOpen(true);
+    };
+
+    const confirmCredentialsAndRun = async () => {
+        setCredModalOpen(false);
+        if (pendingRunAction) await pendingRunAction();
+        setPendingRunAction(null);
+    };
+
+    const getCredentials = () =>
+        credUsername ? { username: credUsername, password: credPassword } : undefined;
+
     // ── Run ───────────────────────────────────────────────────────────────────
 
     const runSelected = async () => {
         if (!selectedPlan || selectedScenarios.size === 0) {
             setToast({ message: "Select scenarios to run", type: "error" }); return;
         }
-        setRunning(true); setRunResults({});
-        try {
-            const result = await api.runScenarios(selectedPlan.id, Array.from(selectedScenarios));
-            setActiveRunId(result.run_id);
-            setToast({ message: `Running ${result.scenarios_count} scenarios...`, type: "success" });
-            const iv = setInterval(async () => {
-                const run = await api.getRunStatus(result.run_id);
-                if (run.results) setRunResults(run.results);
-                if (run.status === "completed" || run.status === "failed") {
-                    clearInterval(iv); setRunning(false);
-                    const passed = Object.values(run.results || {}).filter((r: any) => r.status === "passed").length;
-                    const total = Object.keys(run.results || {}).length;
-                    setToast({ message: `Done: ${passed}/${total} passed`, type: passed === total ? "success" : "error" });
-                }
-            }, 1500);
-        } catch (_) { setRunning(false); setToast({ message: "Failed to run scenarios", type: "error" }); }
+        askCredentialsThen(async () => {
+            setRunning(true); setRunResults({});
+            try {
+                const result = await api.runScenarios(selectedPlan!.id, Array.from(selectedScenarios), getCredentials());
+                setActiveRunId(result.run_id);
+                setToast({ message: `Running ${result.scenarios_count} scenarios...`, type: "success" });
+                const iv = setInterval(async () => {
+                    const run = await api.getRunStatus(result.run_id);
+                    if (run.results) setRunResults(run.results);
+                    if (run.status === "completed" || run.status === "failed") {
+                        clearInterval(iv); setRunning(false);
+                        if ((run as any).heal_summary) setHealSummary((run as any).heal_summary);
+                        const passed = Object.values(run.results || {}).filter((r: any) => r.status === "passed").length;
+                        const total = Object.keys(run.results || {}).length;
+                        const healed = (run as any).heal_summary?.total_healed || 0;
+                        setToast({ message: `Done: ${passed}/${total} passed${healed ? ` · ${healed} selector${healed > 1 ? "s" : ""} self-healed` : ""}`, type: passed === total ? "success" : "error" });
+                    }
+                }, 1500);
+            } catch (_) { setRunning(false); setToast({ message: "Failed to run scenarios", type: "error" }); }
+        });
     };
 
     const runModule = async (name: string) => {
         if (!selectedPlan) return;
-        setRunning(true); setRunResults({});
-        try {
-            const result = await api.runModule(selectedPlan.id, name);
-            setActiveRunId(result.run_id);
-            setToast({ message: `Running ${name}...`, type: "success" });
-            const iv = setInterval(async () => {
-                const run = await api.getRunStatus(result.run_id);
-                if (run.results) setRunResults(run.results);
-                if (run.status === "completed" || run.status === "failed") { clearInterval(iv); setRunning(false); }
-            }, 1500);
-        } catch (_) { setRunning(false); }
+        askCredentialsThen(async () => {
+            setRunning(true); setRunResults({}); setHealSummary(null);
+            try {
+                const result = await api.runModule(selectedPlan!.id, name, getCredentials());
+                setActiveRunId(result.run_id);
+                setToast({ message: `Running ${name}...`, type: "success" });
+                const iv = setInterval(async () => {
+                    const run = await api.getRunStatus(result.run_id);
+                    if (run.results) setRunResults(run.results);
+                    if (run.status === "completed" || run.status === "failed") {
+                        clearInterval(iv); setRunning(false);
+                        if ((run as any).heal_summary) setHealSummary((run as any).heal_summary);
+                    }
+                }, 1500);
+            } catch (_) { setRunning(false); }
+        });
     };
 
     const runAll = async () => {
         if (!selectedPlan) return;
         const all = new Set<string>();
         Object.values(selectedPlan.test_plan?.modules || {}).forEach(m => m.scenarios.forEach(s => all.add(s.id)));
-        setSelectedScenarios(all); setRunning(true); setRunResults({});
-        try {
-            const result = await api.runScenarios(selectedPlan.id, []);
-            setActiveRunId(result.run_id);
-            setToast({ message: `Running all ${result.scenarios_count} scenarios...`, type: "success" });
-            const iv = setInterval(async () => {
-                const run = await api.getRunStatus(result.run_id);
-                if (run.results) setRunResults(run.results);
-                if (run.status === "completed" || run.status === "failed") { clearInterval(iv); setRunning(false); }
-            }, 1500);
-        } catch (_) { setRunning(false); }
+        setSelectedScenarios(all);
+        askCredentialsThen(async () => {
+            setRunning(true); setRunResults({}); setHealSummary(null);
+            try {
+                const result = await api.runScenarios(selectedPlan!.id, [], getCredentials());
+                setActiveRunId(result.run_id);
+                setToast({ message: `Running all ${result.scenarios_count} scenarios...`, type: "success" });
+                const iv = setInterval(async () => {
+                    const run = await api.getRunStatus(result.run_id);
+                    if (run.results) setRunResults(run.results);
+                    if (run.status === "completed" || run.status === "failed") {
+                        clearInterval(iv); setRunning(false);
+                        if ((run as any).heal_summary) setHealSummary((run as any).heal_summary);
+                        const passed = Object.values(run.results || {}).filter((r: any) => r.status === "passed").length;
+                        const total = Object.keys(run.results || {}).length;
+                        const healed = (run as any).heal_summary?.total_healed || 0;
+                        setToast({ message: `Done: ${passed}/${total} passed${healed ? ` · ${healed} selector${healed > 1 ? "s" : ""} self-healed` : ""}`, type: passed === total ? "success" : "error" });
+                    }
+                }, 1500);
+            } catch (_) { setRunning(false); }
+        });
     };
 
     const deletePlan = async (planId: string) => {
@@ -516,14 +613,147 @@ export default function ScenariosPage() {
         catch (_) {}
     };
 
+    // ── Multi-Agent handlers ──────────────────────────────────────────────────
+
+    const loadAgents = async (planId: string) => {
+        setAgentsLoading(true);
+        try {
+            const result = await listPlanAgents(planId);
+            setAgents(result.agents);
+        } catch (_) {
+            setAgents([]);
+        } finally {
+            setAgentsLoading(false);
+        }
+    };
+
+    const handleCreateAgents = async () => {
+        if (!selectedPlan) return;
+        setAgentsLoading(true);
+        try {
+            const result = await createPlanAgents(selectedPlan.id);
+            setAgents(result.agents);
+            setExpandedAgents(new Set(result.agents.map(a => a.module)));
+            setToast({ message: `Created ${result.agents_count} module agents — answer their questions for smarter tests`, type: "success" });
+        } catch (e) {
+            setToast({ message: "Failed to create agents", type: "error" });
+        } finally {
+            setAgentsLoading(false);
+        }
+    };
+
+    const handleAnswerQuestion = async (module: string, questionId: string, answer: string) => {
+        if (!selectedPlan) return;
+        try {
+            await answerAgentQuestion(selectedPlan.id, module, questionId, answer);
+            await loadAgents(selectedPlan.id);
+        } catch (_) {
+            setToast({ message: "Failed to answer question", type: "error" });
+        }
+    };
+
+    const handleSkipQuestion = async (module: string, questionId: string) => {
+        if (!selectedPlan) return;
+        try {
+            await skipAgentQuestion(selectedPlan.id, module, questionId);
+            await loadAgents(selectedPlan.id);
+        } catch (_) {
+            setToast({ message: "Failed to skip question", type: "error" });
+        }
+    };
+
+    const handleGenerateAll = async () => {
+        if (!selectedPlan) return;
+        setAgentsGenerating(true);
+        try {
+            await generateAllAgentScenarios(selectedPlan.id);
+            await loadAgents(selectedPlan.id);
+            setToast({ message: "Scenarios generated for all agents!", type: "success" });
+        } catch (_) {
+            setToast({ message: "Generation failed", type: "error" });
+        } finally {
+            setAgentsGenerating(false);
+        }
+    };
+
+    const handleMergeAndReload = async () => {
+        if (!selectedPlan) return;
+        setAgentsMerging(true);
+        try {
+            const result = await mergeAgentScenarios(selectedPlan.id);
+            await reloadPlan(selectedPlan.id);
+            setToast({ message: `Merged ${result.scenarios_added} agent scenarios into plan!`, type: "success" });
+        } catch (_) {
+            setToast({ message: "Merge failed", type: "error" });
+        } finally {
+            setAgentsMerging(false);
+        }
+    };
+
+    const handleRunAgents = async () => {
+        if (!selectedPlan) return;
+        askCredentialsThen(async () => {
+            setAgentsRunning(true);
+            try {
+                const result = await runAgentScenarios(selectedPlan!.id, getCredentials());
+                setActiveRunId(result.run_id);
+                setToast({ message: `Running ${result.scenarios_count} agent scenarios...`, type: "success" });
+                const iv = setInterval(async () => {
+                    const run = await api.getRunStatus(result.run_id);
+                    if (run.results) setRunResults(run.results);
+                    if (run.status === "completed" || run.status === "failed") {
+                        clearInterval(iv);
+                        setAgentsRunning(false);
+                        await reloadPlan(selectedPlan!.id);
+                    }
+                }, 1500);
+            } catch (_) {
+                setAgentsRunning(false);
+                setToast({ message: "Failed to run agent scenarios", type: "error" });
+            }
+        });
+    };
+
+    // ── Feed Knowledge to an agent ────────────────────────────────────────────
+
+    const handleFeedAgentKnowledge = async (module: string) => {
+        const text = agentFeedTexts[module]?.trim();
+        if (!selectedPlan || !text) return;
+        setAgentFeedLoading(prev => ({ ...prev, [module]: true }));
+        try {
+            const result = await feedAgentKnowledge(selectedPlan.id, module, text, "manual");
+            const { rules_added, edges_added } = result.extracted as any || { rules_added: 0, edges_added: 0 };
+            const ruleCount = result.extracted?.business_rules?.length || 0;
+            const edgeCount = result.extracted?.edge_cases?.length || 0;
+            setToast({ message: `Agent trained — ${ruleCount} rules + ${edgeCount} edge cases extracted`, type: "success" });
+            setAgentFeedTexts(prev => ({ ...prev, [module]: "" }));
+            setAgentFeedExpanded(prev => { const s = new Set(prev); s.delete(module); return s; });
+            await loadAgents(selectedPlan.id);
+        } catch (_) {
+            setToast({ message: "Failed to feed knowledge to agent", type: "error" });
+        } finally {
+            setAgentFeedLoading(prev => ({ ...prev, [module]: false }));
+        }
+    };
+
+    const agentStatusColor = (status: string) => ({
+        idle: "bg-slate-500/15 text-slate-400",
+        exploring: "bg-blue-500/15 text-blue-400",
+        questioning: "bg-yellow-500/15 text-yellow-400",
+        generating: "bg-purple-500/15 text-purple-400",
+        ready: "bg-emerald-500/15 text-emerald-400",
+        running: "bg-blue-500/15 text-blue-400",
+        done: "bg-emerald-500/15 text-emerald-400",
+        failed: "bg-red-500/15 text-red-400",
+    }[status] || "bg-slate-500/15 text-slate-400");
+
     // ── KT Tabs ───────────────────────────────────────────────────────────────
 
-    const ktTabs: { id: KtTab; label: string; icon: React.ReactNode; desc: string }[] = [
-        { id: "basic", label: "Context", icon: <BookOpen size={14} />, desc: "App description & roles" },
-        { id: "stories", label: "User Stories", icon: <FileText size={14} />, desc: "Paste Jira / Gherkin" },
-        { id: "document", label: "Upload Doc", icon: <Upload size={14} />, desc: "PDF, DOCX, TXT" },
-        { id: "chat", label: "AI Chat", icon: <MessageSquare size={14} />, desc: "Guided KT conversation" },
-        { id: "record", label: "Record Session", icon: <Mic size={14} />, desc: "Shadow mode recording" },
+    const ktTabs: { id: KtTab; label: string; icon: React.ReactNode; badge?: number }[] = [
+        { id: "agents", label: "AI Agents", icon: <Users size={14} />, badge: agents.filter(a => a.pending_questions_count > 0).reduce((s, a) => s + a.pending_questions_count, 0) || undefined },
+        { id: "train", label: "Train AI", icon: <Brain size={14} /> },
+        { id: "chat", label: "Chat", icon: <MessageSquare size={14} /> },
+        { id: "record", label: "Record", icon: <Mic size={14} /> },
     ];
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -535,12 +765,105 @@ export default function ScenariosPage() {
             <Sidebar />
             <main className="flex-1 p-8 ml-64">
 
+                {/* ── Credentials modal ──────────────────────────────────── */}
+                {credModalOpen && (
+                    <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+                        <div className="bg-[#121214] border border-white/10 rounded-xl p-6 w-full max-w-md shadow-2xl">
+                            <h2 className="text-white font-bold text-lg mb-1">Test Credentials</h2>
+                            <p className="text-slate-400 text-sm mb-4">
+                                Credentials are used only at runtime to fill login forms. They are
+                                <span className="text-[#00D4AA] font-medium"> never stored or sent to AI</span>.
+                            </p>
+
+                            <label className="block text-slate-400 text-xs mb-1">Username / Email</label>
+                            <input
+                                type="text"
+                                value={credUsername}
+                                onChange={e => setCredUsername(e.target.value)}
+                                placeholder="your@email.com"
+                                className="w-full px-3 py-2 bg-[#1a1a1d] border border-white/10 rounded-lg text-white text-sm placeholder:text-slate-600 focus:outline-none focus:border-[#00D4AA]/50 mb-3"
+                            />
+
+                            <label className="block text-slate-400 text-xs mb-1">Password</label>
+                            <div className="relative mb-4">
+                                <input
+                                    type={credShowPassword ? "text" : "password"}
+                                    value={credPassword}
+                                    onChange={e => setCredPassword(e.target.value)}
+                                    placeholder="••••••••"
+                                    className="w-full px-3 py-2 bg-[#1a1a1d] border border-white/10 rounded-lg text-white text-sm placeholder:text-slate-600 focus:outline-none focus:border-[#00D4AA]/50 pr-10"
+                                />
+                                <button
+                                    type="button"
+                                    onClick={() => setCredShowPassword(p => !p)}
+                                    className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 text-xs"
+                                >
+                                    {credShowPassword ? "Hide" : "Show"}
+                                </button>
+                            </div>
+
+                            <div className="bg-yellow-500/10 border border-yellow-500/20 rounded-lg px-3 py-2 mb-4 text-xs text-yellow-300">
+                                🔒 Password is masked during recording ([PASSWORD] placeholder) and replaced here at runtime only.
+                            </div>
+
+                            <div className="flex gap-3">
+                                <button
+                                    onClick={() => { setCredModalOpen(false); setPendingRunAction(null); }}
+                                    className="flex-1 py-2 rounded-lg bg-white/5 hover:bg-white/10 text-slate-400 text-sm transition-colors"
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    onClick={confirmCredentialsAndRun}
+                                    className="flex-1 py-2 rounded-lg bg-[#00D4AA] hover:bg-[#00c49a] text-black font-semibold text-sm transition-colors"
+                                >
+                                    Run Tests
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {/* ── Recording paused banner ────────────────────────────── */}
+                {recordingStatus === "recording" && recordingPaused && (
+                    <div className="fixed top-0 left-0 right-0 z-50 bg-gray-800 border-b border-gray-600 px-4 py-2 flex items-center justify-center gap-3">
+                        <span className="text-gray-400 text-sm font-medium">⏸ Recording paused — you navigated off the app domain. Come back to the app to resume.</span>
+                    </div>
+                )}
+                {recordingStatus === "recording" && !recordingPaused && recordingEvents > 0 && (
+                    <div className="fixed top-0 left-0 right-0 z-50 bg-green-900/80 border-b border-green-700 px-4 py-1 flex items-center justify-center gap-3">
+                        <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse inline-block" />
+                        <span className="text-green-300 text-sm font-medium">● Recording — {recordingEvents} events captured</span>
+                    </div>
+                )}
+
                 {/* Header */}
-                <div className="flex items-center justify-between mb-8">
+                <div className="flex items-center justify-between mb-6">
                     <div>
                         <h1 className="text-2xl font-bold text-white">Scenario Testing</h1>
-                        <p className="text-slate-400 mt-1">Explore, teach, and run AI-powered test scenarios</p>
+                        <p className="text-slate-400 mt-1">AI agents that know your app, generate tests, and run them end-to-end</p>
                     </div>
+                </div>
+
+                {/* ── Workflow steps ──────────────────────────────────────── */}
+                <div className="flex items-center gap-2 mb-5 overflow-x-auto">
+                    {[
+                        { n: 1, label: "Explore App", done: !!selectedPlan, active: !selectedPlan },
+                        { n: 2, label: "Create Agents", done: agents.length > 0, active: !!selectedPlan && agents.length === 0 },
+                        { n: 3, label: "Answer Questions", done: agents.length > 0 && agents.every(a => a.pending_questions_count === 0), active: agents.some(a => a.pending_questions_count > 0) },
+                        { n: 4, label: "Generate Scenarios", done: agents.some(a => a.scenarios_count > 0), active: agents.length > 0 && agents.every(a => a.pending_questions_count === 0) && !agents.some(a => a.scenarios_count > 0) },
+                        { n: 5, label: "Run & Validate", done: Object.keys(runResults).length > 0, active: agents.some(a => a.scenarios_count > 0) && Object.keys(runResults).length === 0 },
+                    ].map((step, i) => (
+                        <div key={step.n} className="flex items-center gap-2 shrink-0">
+                            <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${step.done ? "bg-emerald-500/15 text-emerald-400 border border-emerald-500/30" : step.active ? "bg-[#00D4AA]/15 text-[#00D4AA] border border-[#00D4AA]/40" : "bg-white/5 text-slate-500 border border-white/8"}`}>
+                                <span className={`w-4 h-4 rounded-full flex items-center justify-center text-[10px] font-bold ${step.done ? "bg-emerald-500 text-black" : step.active ? "bg-[#00D4AA] text-black" : "bg-white/10 text-slate-500"}`}>
+                                    {step.done ? "✓" : step.n}
+                                </span>
+                                {step.label}
+                            </div>
+                            {i < 4 && <span className="text-slate-700 text-xs">→</span>}
+                        </div>
+                    ))}
                 </div>
 
                 {/* ── Explore Box ─────────────────────────────────────────── */}
@@ -605,7 +928,7 @@ export default function ScenariosPage() {
                     </div>
                 )}
 
-                {/* ── Knowledge Transfer Panel ─────────────────────────────── */}
+                {/* ── Test Builder Panel ─────────────────────────────────── */}
                 <div className="bg-[#121214] border border-white/5 rounded-xl mb-8 overflow-hidden">
                     {/* Panel Toggle */}
                     <button
@@ -613,12 +936,18 @@ export default function ScenariosPage() {
                         className="w-full flex items-center justify-between p-4 hover:bg-white/5 transition-colors"
                     >
                         <div className="flex items-center gap-3">
-                            <Brain size={16} className="text-[#00D4AA]" />
-                            <span className="text-sm font-semibold text-white">Knowledge Transfer (KT)</span>
-                            <span className="text-xs text-slate-500">— Teach the AI about your app for smarter tests</span>
-                            {selectedPlan?.kt_sources && selectedPlan.kt_sources.length > 0 && (
+                            <Users size={16} className="text-[#00D4AA]" />
+                            <span className="text-sm font-semibold text-white">Test Builder</span>
+                            <span className="text-xs text-slate-500">— AI agents, training &amp; recording</span>
+                            {agents.filter(a => a.pending_questions_count > 0).length > 0 && (
+                                <span className="px-2 py-0.5 text-xs bg-yellow-500/15 text-yellow-400 rounded-full border border-yellow-500/30 flex items-center gap-1">
+                                    <AlertCircle size={10} />
+                                    {agents.reduce((s, a) => s + a.pending_questions_count, 0)} questions waiting
+                                </span>
+                            )}
+                            {selectedPlan?.test_plan && (
                                 <span className="px-2 py-0.5 text-xs bg-[#00D4AA]/10 text-[#00D4AA] rounded-full">
-                                    {selectedPlan.kt_sources.length} source{selectedPlan.kt_sources.length > 1 ? "s" : ""} applied
+                                    {selectedPlan.test_plan.total_scenarios} scenarios
                                 </span>
                             )}
                         </div>
@@ -627,160 +956,161 @@ export default function ScenariosPage() {
 
                     {showKtPanel && (
                         <div className="border-t border-white/5">
-                            {/* Tab bar */}
-                            <div className="flex border-b border-white/5 px-4 gap-1 overflow-x-auto">
+                            {/* Tab bar — 4 focused tabs */}
+                            <div className="flex border-b border-white/5 px-2 gap-0">
                                 {ktTabs.map(tab => (
                                     <button
                                         key={tab.id}
-                                        onClick={() => { setKtTab(tab.id); if (tab.id === "chat") openChat(); }}
-                                        className={`flex items-center gap-1.5 px-4 py-3 text-sm font-medium whitespace-nowrap border-b-2 transition-colors ${ktTab === tab.id
+                                        onClick={() => {
+                                            setKtTab(tab.id);
+                                            if (tab.id === "chat") openChat();
+                                            if (tab.id === "agents" && selectedPlan) loadAgents(selectedPlan.id);
+                                        }}
+                                        className={`relative flex items-center gap-2 px-5 py-3 text-sm font-medium whitespace-nowrap border-b-2 transition-colors ${ktTab === tab.id
                                             ? "border-[#00D4AA] text-[#00D4AA]"
                                             : "border-transparent text-slate-400 hover:text-slate-200"
                                         }`}
                                     >
                                         {tab.icon}
                                         {tab.label}
+                                        {tab.badge ? (
+                                            <span className="w-4 h-4 rounded-full bg-yellow-500 text-black text-[10px] font-bold flex items-center justify-center">
+                                                {tab.badge}
+                                            </span>
+                                        ) : null}
                                     </button>
                                 ))}
                             </div>
 
-                            {/* ── Tab: Basic Context ── */}
-                            {ktTab === "basic" && (
-                                <div className="p-5 space-y-5">
-                                    <div className="flex items-start gap-3 p-3 rounded-lg bg-[#00D4AA]/5 border border-[#00D4AA]/15">
-                                        <Lightbulb size={15} className="text-[#00D4AA] mt-0.5 shrink-0" />
-                                        <p className="text-xs text-slate-400">This context is used <strong className="text-white">during exploration</strong>. Set it before clicking Explore for best results.</p>
-                                    </div>
+                            {/* ── Tab: Train AI (merged: context + stories + doc upload) ── */}
+                            {ktTab === "train" && (
+                                <div className="p-5 space-y-6">
+                                    {/* Section 1: App Context */}
                                     <div>
-                                        <label className="block text-sm font-medium text-white mb-2">What does this app do?</label>
+                                        <div className="flex items-center gap-2 mb-3">
+                                            <BookOpen size={14} className="text-[#00D4AA]" />
+                                            <h4 className="text-sm font-semibold text-white">App Context</h4>
+                                            <span className="text-xs text-slate-500">— set before Explore for best results</span>
+                                        </div>
                                         <textarea
                                             value={appDescription}
                                             onChange={e => setAppDescription(e.target.value)}
-                                            placeholder="e.g. A B2B SaaS for project management. Teams create projects, assign tasks, and manage billing. Admins manage team members."
-                                            rows={3}
-                                            className="w-full px-4 py-3 bg-[#1a1a1d] border border-white/10 rounded-lg text-white text-sm placeholder:text-slate-600 focus:outline-none focus:border-[#00D4AA]/50 resize-none"
+                                            placeholder="e.g. Fleet tracking SaaS for cold chain logistics. Users monitor temperature, location and alerts for refrigerated transport units."
+                                            rows={2}
+                                            className="w-full px-3 py-2.5 bg-[#1a1a1d] border border-white/10 rounded-lg text-white text-sm placeholder:text-slate-600 focus:outline-none focus:border-[#00D4AA]/50 resize-none"
                                         />
-                                    </div>
-                                    <div>
-                                        <div className="flex items-center justify-between mb-3">
-                                            <label className="text-sm font-medium text-white flex items-center gap-2"><Users size={14} className="text-slate-400" /> User Roles & Credentials</label>
-                                            <button onClick={addUserRole} className="text-xs text-[#00D4AA] hover:text-[#00C099] flex items-center gap-1"><Plus size={12} /> Add Role</button>
+                                        <div className="mt-2 flex items-center justify-between">
+                                            <span className="text-xs text-slate-500 flex items-center gap-1"><Users size={11} /> User roles</span>
+                                            <button onClick={addUserRole} className="text-xs text-[#00D4AA] flex items-center gap-1"><Plus size={11} /> Add role</button>
                                         </div>
-                                        {userRoles.length === 0 && <p className="text-xs text-slate-600 italic">No roles — AI will infer them automatically.</p>}
-                                        <div className="space-y-2">
+                                        {userRoles.length === 0 && <p className="text-xs text-slate-600 italic mt-1">No roles — AI will infer them automatically.</p>}
+                                        <div className="space-y-2 mt-2">
                                             {userRoles.map((r, i) => (
                                                 <div key={i} className="grid grid-cols-[1fr_2fr_2fr_auto] gap-2">
-                                                    <input placeholder="admin / user" value={r.role} onChange={e => updateUserRole(i, "role", e.target.value)} className="px-3 py-2 bg-[#1a1a1d] border border-white/10 rounded-lg text-white text-sm placeholder:text-slate-600 focus:outline-none focus:border-[#00D4AA]/50" />
-                                                    <input type="email" placeholder="test@example.com" value={r.email} onChange={e => updateUserRole(i, "email", e.target.value)} className="px-3 py-2 bg-[#1a1a1d] border border-white/10 rounded-lg text-white text-sm placeholder:text-slate-600 focus:outline-none focus:border-[#00D4AA]/50" />
-                                                    <input type="password" placeholder="password" value={r.password} onChange={e => updateUserRole(i, "password", e.target.value)} className="px-3 py-2 bg-[#1a1a1d] border border-white/10 rounded-lg text-white text-sm placeholder:text-slate-600 focus:outline-none focus:border-[#00D4AA]/50" />
-                                                    <button onClick={() => removeUserRole(i)} className="p-2 hover:bg-red-500/10 rounded text-red-400"><Minus size={14} /></button>
+                                                    <input placeholder="admin" value={r.role} onChange={e => updateUserRole(i, "role", e.target.value)} className="px-2.5 py-2 bg-[#1a1a1d] border border-white/10 rounded-lg text-white text-sm placeholder:text-slate-600 focus:outline-none" />
+                                                    <input type="email" placeholder="user@email.com" value={r.email} onChange={e => updateUserRole(i, "email", e.target.value)} className="px-2.5 py-2 bg-[#1a1a1d] border border-white/10 rounded-lg text-white text-sm placeholder:text-slate-600 focus:outline-none" />
+                                                    <input type="password" placeholder="password" value={r.password} onChange={e => updateUserRole(i, "password", e.target.value)} className="px-2.5 py-2 bg-[#1a1a1d] border border-white/10 rounded-lg text-white text-sm placeholder:text-slate-600 focus:outline-none" />
+                                                    <button onClick={() => removeUserRole(i)} className="p-2 hover:bg-red-500/10 rounded text-red-400"><Minus size={13} /></button>
                                                 </div>
                                             ))}
                                         </div>
                                     </div>
+
+                                    <div className="border-t border-white/5" />
+
+                                    {/* Section 2: User Stories */}
                                     <div>
                                         <div className="flex items-center justify-between mb-3">
-                                            <label className="text-sm font-medium text-white flex items-center gap-2"><Zap size={14} className="text-slate-400" /> Key User Journeys</label>
-                                            <button onClick={addJourney} className="text-xs text-[#00D4AA] hover:text-[#00C099] flex items-center gap-1"><Plus size={12} /> Add</button>
+                                            <div className="flex items-center gap-2">
+                                                <FileText size={14} className="text-blue-400" />
+                                                <h4 className="text-sm font-semibold text-white">Paste User Stories</h4>
+                                            </div>
+                                            <div className="flex gap-2">
+                                                {(["plain", "gherkin", "jira"] as const).map(f => (
+                                                    <label key={f} className="flex items-center gap-1 text-xs cursor-pointer">
+                                                        <input type="radio" name="format" value={f} checked={storiesFormat === f} onChange={() => setStoriesFormat(f)} />
+                                                        <span className={storiesFormat === f ? "text-white" : "text-slate-500"}>{f}</span>
+                                                    </label>
+                                                ))}
+                                            </div>
                                         </div>
-                                        <div className="space-y-2">
-                                            {keyJourneys.map((j, i) => (
-                                                <div key={i} className="flex gap-2">
-                                                    <input value={j} onChange={e => updateJourney(i, e.target.value)} placeholder={`e.g. User registers → verifies email → creates first project`} className="flex-1 px-3 py-2 bg-[#1a1a1d] border border-white/10 rounded-lg text-white text-sm placeholder:text-slate-600 focus:outline-none focus:border-[#00D4AA]/50" />
-                                                    {keyJourneys.length > 1 && <button onClick={() => removeJourney(i)} className="p-2 hover:bg-red-500/10 rounded text-red-400"><Minus size={14} /></button>}
+                                        <textarea
+                                            value={storiesText}
+                                            onChange={e => setStoriesText(e.target.value)}
+                                            placeholder="As a fleet manager I want to see live GPS locations so that I can monitor my vehicles..."
+                                            rows={5}
+                                            className="w-full px-3 py-2.5 bg-[#1a1a1d] border border-white/10 rounded-lg text-white text-sm font-mono placeholder:text-slate-600 focus:outline-none focus:border-blue-500/40 resize-none"
+                                        />
+                                        <div className="flex items-center justify-between mt-2">
+                                            <span className="text-xs text-slate-500">{selectedPlan ? `Plan: ${(() => { try { return new URL(selectedPlan.url).hostname; } catch { return selectedPlan.url.slice(0,25); } })()}` : "Select a plan first"}</span>
+                                            <button onClick={handleImportStories} disabled={importingStories || !selectedPlan || !storiesText.trim()} className="px-4 py-1.5 bg-blue-500/20 hover:bg-blue-500/30 text-blue-300 text-sm font-medium rounded-lg transition-colors disabled:opacity-40 flex items-center gap-1.5">
+                                                {importingStories ? <Loader2 size={13} className="animate-spin" /> : <CheckSquare size={13} />} Import
+                                            </button>
+                                        </div>
+                                    </div>
+
+                                    <div className="border-t border-white/5" />
+
+                                    {/* Section 3: Document Upload */}
+                                    <div>
+                                        <div className="flex items-center gap-2 mb-3">
+                                            <Upload size={14} className="text-purple-400" />
+                                            <h4 className="text-sm font-semibold text-white">Upload Requirements Doc</h4>
+                                            <span className="text-xs text-slate-500">PDF, DOCX, TXT</span>
+                                        </div>
+                                        <div
+                                            onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+                                            onDragLeave={() => setDragOver(false)}
+                                            onDrop={handleDocDrop}
+                                            onClick={() => fileInputRef.current?.click()}
+                                            className={`border-2 border-dashed rounded-xl p-6 text-center cursor-pointer transition-colors ${dragOver ? "border-purple-400 bg-purple-500/5" : docFile ? "border-[#00D4AA]/40 bg-[#00D4AA]/5" : "border-white/10 hover:border-white/20"}`}
+                                        >
+                                            {docFile ? (
+                                                <div className="flex items-center justify-center gap-3">
+                                                    <FileText size={20} className="text-[#00D4AA]" />
+                                                    <span className="text-white text-sm">{docFile.name}</span>
+                                                    <span className="text-xs text-slate-400">{(docFile.size / 1024).toFixed(0)} KB</span>
+                                                    <button onClick={e => { e.stopPropagation(); setDocFile(null); }} className="text-xs text-red-400 hover:text-red-300">✕</button>
                                                 </div>
-                                            ))}
+                                            ) : (
+                                                <p className="text-slate-400 text-sm">Drag & drop or click to choose file</p>
+                                            )}
+                                            <input ref={fileInputRef} type="file" accept=".pdf,.docx,.doc,.txt,.md,.html,.htm" className="hidden" onChange={e => e.target.files?.[0] && setDocFile(e.target.files[0])} />
+                                        </div>
+                                        <div className="flex items-center justify-between mt-2">
+                                            <label className="flex items-center gap-2 cursor-pointer select-none">
+                                                <div
+                                                    onClick={() => setRouteToAgents(p => !p)}
+                                                    className={`w-9 h-5 rounded-full relative transition-colors ${routeToAgents ? "bg-indigo-500" : "bg-white/10"}`}
+                                                >
+                                                    <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${routeToAgents ? "translate-x-4" : "translate-x-0.5"}`} />
+                                                </div>
+                                                <span className="text-xs text-slate-400">Also train agents from this content</span>
+                                                {agents.length > 0 && routeToAgents && (
+                                                    <span className="text-xs text-indigo-400">{agents.length} agents</span>
+                                                )}
+                                            </label>
+                                            <button onClick={handleDocUpload} disabled={uploadingDoc || !selectedPlan || !docFile} className="px-4 py-1.5 bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 text-sm font-medium rounded-lg transition-colors disabled:opacity-40 flex items-center gap-1.5">
+                                                {uploadingDoc ? <Loader2 size={13} className="animate-spin" /> : <Upload size={13} />} Parse Doc
+                                            </button>
                                         </div>
                                     </div>
-                                </div>
-                            )}
 
-                            {/* ── Tab: User Stories ── */}
-                            {ktTab === "stories" && (
-                                <div className="p-5 space-y-4">
-                                    <div className="flex items-start gap-3 p-3 rounded-lg bg-blue-500/5 border border-blue-500/15">
-                                        <FileText size={15} className="text-blue-400 mt-0.5 shrink-0" />
-                                        <p className="text-xs text-slate-400">Paste user stories, Jira tickets, acceptance criteria, or Gherkin scenarios. AI will convert them into test cases and <strong className="text-white">add them to the selected plan</strong>.</p>
-                                    </div>
-                                    <div className="flex gap-3">
-                                        <label className="text-sm text-slate-400">Format:</label>
-                                        {(["plain", "gherkin", "jira"] as const).map(f => (
-                                            <label key={f} className="flex items-center gap-1.5 text-sm cursor-pointer">
-                                                <input type="radio" name="format" value={f} checked={storiesFormat === f} onChange={() => setStoriesFormat(f)} className="text-[#00D4AA]" />
-                                                <span className={storiesFormat === f ? "text-white" : "text-slate-400"}>{f.charAt(0).toUpperCase() + f.slice(1)}</span>
-                                            </label>
-                                        ))}
-                                    </div>
-                                    <textarea
-                                        value={storiesText}
-                                        onChange={e => setStoriesText(e.target.value)}
-                                        placeholder={storiesFormat === "gherkin"
-                                            ? `Feature: User Authentication\n\nScenario: Valid login\n  Given I am on the login page\n  When I enter valid credentials\n  Then I should be redirected to dashboard`
-                                            : storiesFormat === "jira"
-                                            ? `As a user I want to login with email and password so that I can access my dashboard\nAs an admin I want to manage user accounts so that I can control access`
-                                            : `User can login with email and password\nInvalid password shows error message\nForgot password sends reset email\nAdmin can delete user accounts`
-                                        }
-                                        rows={10}
-                                        className="w-full px-4 py-3 bg-[#1a1a1d] border border-white/10 rounded-lg text-white text-sm font-mono placeholder:text-slate-600 focus:outline-none focus:border-[#00D4AA]/50 resize-none"
-                                    />
-                                    <div className="flex items-center justify-between">
-                                        <span className="text-xs text-slate-500">
-                                            {selectedPlan ? `Will add to: ${new URL(selectedPlan.url).hostname}` : "Select a plan first"}
-                                        </span>
-                                        <button
-                                            onClick={handleImportStories}
-                                            disabled={importingStories || !selectedPlan || !storiesText.trim()}
-                                            className="px-5 py-2.5 bg-[#00D4AA] hover:bg-[#00C099] text-black font-semibold rounded-lg transition-colors disabled:opacity-50 flex items-center gap-2"
-                                        >
-                                            {importingStories ? <><Loader2 size={14} className="animate-spin" /> Parsing...</> : <><CheckSquare size={14} /> Import Stories</>}
-                                        </button>
-                                    </div>
-                                </div>
-                            )}
-
-                            {/* ── Tab: Document Upload ── */}
-                            {ktTab === "document" && (
-                                <div className="p-5 space-y-4">
-                                    <div className="flex items-start gap-3 p-3 rounded-lg bg-purple-500/5 border border-purple-500/15">
-                                        <Upload size={15} className="text-purple-400 mt-0.5 shrink-0" />
-                                        <p className="text-xs text-slate-400">Upload a requirements document (PDF, DOCX, TXT, Confluence export). AI will extract testable requirements and generate scenarios.</p>
-                                    </div>
-
-                                    {/* Drop Zone */}
-                                    <div
-                                        onDragOver={e => { e.preventDefault(); setDragOver(true); }}
-                                        onDragLeave={() => setDragOver(false)}
-                                        onDrop={handleDocDrop}
-                                        onClick={() => fileInputRef.current?.click()}
-                                        className={`border-2 border-dashed rounded-xl p-10 text-center cursor-pointer transition-colors ${dragOver ? "border-purple-400 bg-purple-500/5" : docFile ? "border-[#00D4AA]/40 bg-[#00D4AA]/5" : "border-white/10 hover:border-white/20"}`}
-                                    >
-                                        {docFile ? (
-                                            <div className="flex flex-col items-center gap-2">
-                                                <FileText size={32} className="text-[#00D4AA]" />
-                                                <p className="text-white font-medium">{docFile.name}</p>
-                                                <p className="text-sm text-slate-400">{(docFile.size / 1024).toFixed(1)} KB</p>
-                                                <button onClick={e => { e.stopPropagation(); setDocFile(null); }} className="text-xs text-red-400 hover:text-red-300 mt-2">Remove</button>
+                                    {/* Route-to-agents toggle for User Stories too */}
+                                    {agents.length > 0 && (
+                                        <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-indigo-500/5 border border-indigo-500/15">
+                                            <div
+                                                onClick={() => setRouteToAgents(p => !p)}
+                                                className={`w-9 h-5 rounded-full relative transition-colors cursor-pointer shrink-0 ${routeToAgents ? "bg-indigo-500" : "bg-white/10"}`}
+                                            >
+                                                <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white shadow transition-transform ${routeToAgents ? "translate-x-4" : "translate-x-0.5"}`} />
                                             </div>
-                                        ) : (
-                                            <div className="flex flex-col items-center gap-2">
-                                                <Upload size={32} className="text-slate-600" />
-                                                <p className="text-white">Drag & drop or click to upload</p>
-                                                <p className="text-sm text-slate-400">PDF, DOCX, TXT, HTML — max 10 MB</p>
+                                            <div>
+                                                <p className="text-xs text-white font-medium">Auto-train agents</p>
+                                                <p className="text-xs text-slate-500">Stories and docs will also be routed to matching module agents for deeper learning</p>
                                             </div>
-                                        )}
-                                        <input ref={fileInputRef} type="file" accept=".pdf,.docx,.doc,.txt,.md,.html,.htm" className="hidden" onChange={e => e.target.files?.[0] && setDocFile(e.target.files[0])} />
-                                    </div>
-
-                                    <div className="flex items-center justify-between">
-                                        <span className="text-xs text-slate-500">{selectedPlan ? `Will add to: ${new URL(selectedPlan.url).hostname}` : "Select a plan first"}</span>
-                                        <button
-                                            onClick={handleDocUpload}
-                                            disabled={uploadingDoc || !selectedPlan || !docFile}
-                                            className="px-5 py-2.5 bg-[#00D4AA] hover:bg-[#00C099] text-black font-semibold rounded-lg transition-colors disabled:opacity-50 flex items-center gap-2"
-                                        >
-                                            {uploadingDoc ? <><Loader2 size={14} className="animate-spin" /> Parsing...</> : <><Upload size={14} /> Parse Document</>}
-                                        </button>
-                                    </div>
+                                        </div>
+                                    )}
                                 </div>
                             )}
 
@@ -969,6 +1299,266 @@ export default function ScenariosPage() {
                                     )}
                                 </div>
                             )}
+                            {/* ── Tab: Agents ── */}
+                            {ktTab === "agents" && (
+                                <div className="p-5 space-y-4">
+                                    <div className="flex items-start gap-3 p-3 rounded-lg bg-indigo-500/5 border border-indigo-500/15">
+                                        <Users size={15} className="text-indigo-400 mt-0.5 shrink-0" />
+                                        <p className="text-xs text-slate-400">
+                                            <strong className="text-white">Module Agents</strong> — Each agent owns one module, learns it deeply, asks you questions, and generates comprehensive test coverage automatically. Like having a dedicated QA engineer per feature.
+                                        </p>
+                                    </div>
+
+                                    {!selectedPlan ? (
+                                        <p className="text-slate-500 text-sm text-center py-6">Select a plan first to create agents</p>
+                                    ) : agentsLoading ? (
+                                        <div className="flex justify-center py-10">
+                                            <Loader2 size={28} className="text-indigo-400 animate-spin" />
+                                        </div>
+                                    ) : agents.length === 0 ? (
+                                        <div className="text-center py-8 space-y-3">
+                                            <Users size={36} className="text-slate-600 mx-auto" />
+                                            <p className="text-slate-400 text-sm">No agents yet — create one per module</p>
+                                            <button
+                                                onClick={handleCreateAgents}
+                                                className="px-6 py-2.5 bg-indigo-500 hover:bg-indigo-400 text-white font-semibold rounded-lg transition-colors flex items-center gap-2 mx-auto"
+                                            >
+                                                <Plus size={15} /> Create Module Agents
+                                            </button>
+                                        </div>
+                                    ) : (
+                                        <div className="space-y-3">
+                                            {/* Agent toolbar */}
+                                            <div className="flex items-center gap-2 flex-wrap">
+                                                <button
+                                                    onClick={handleCreateAgents}
+                                                    className="px-3 py-1.5 text-xs bg-white/5 hover:bg-white/10 text-slate-300 border border-white/10 rounded-lg flex items-center gap-1.5 transition-colors"
+                                                >
+                                                    <RefreshCw size={12} /> Recreate Agents
+                                                </button>
+                                                <button
+                                                    onClick={handleGenerateAll}
+                                                    disabled={agentsGenerating}
+                                                    className="px-3 py-1.5 text-xs bg-purple-500/10 hover:bg-purple-500/20 text-purple-300 border border-purple-500/20 rounded-lg flex items-center gap-1.5 transition-colors disabled:opacity-50"
+                                                >
+                                                    {agentsGenerating ? <Loader2 size={12} className="animate-spin" /> : <Brain size={12} />}
+                                                    Generate All
+                                                </button>
+                                                <button
+                                                    onClick={handleMergeAndReload}
+                                                    disabled={agentsMerging || !agents.some(a => a.scenarios_count > 0)}
+                                                    className="px-3 py-1.5 text-xs bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border border-emerald-500/20 rounded-lg flex items-center gap-1.5 transition-colors disabled:opacity-50"
+                                                >
+                                                    {agentsMerging ? <Loader2 size={12} className="animate-spin" /> : <CheckSquare size={12} />}
+                                                    Merge to Plan
+                                                </button>
+                                                <button
+                                                    onClick={handleRunAgents}
+                                                    disabled={agentsRunning}
+                                                    className="px-3 py-1.5 text-xs bg-[#00D4AA]/10 hover:bg-[#00D4AA]/20 text-[#00D4AA] border border-[#00D4AA]/20 rounded-lg flex items-center gap-1.5 transition-colors disabled:opacity-50 ml-auto"
+                                                >
+                                                    {agentsRunning ? <Loader2 size={12} className="animate-spin" /> : <Play size={12} />}
+                                                    Run All Agent Tests
+                                                </button>
+                                            </div>
+
+                                            {/* Agent cards */}
+                                            {agents.map(agent => {
+                                                const isExpanded = expandedAgents.has(agent.module);
+                                                const hasPending = agent.pending_questions_count > 0;
+                                                return (
+                                                    <div key={agent.module} className={`border rounded-xl overflow-hidden transition-colors ${hasPending ? "border-yellow-500/30 bg-yellow-500/3" : "border-white/8 bg-[#0f0f11]"}`}>
+                                                        {/* Agent header */}
+                                                        <div
+                                                            className="flex items-center justify-between p-3 cursor-pointer hover:bg-white/5 transition-colors"
+                                                            onClick={() => setExpandedAgents(prev => { const s = new Set(prev); s.has(agent.module) ? s.delete(agent.module) : s.add(agent.module); return s; })}
+                                                        >
+                                                            <div className="flex items-center gap-3">
+                                                                {isExpanded ? <ChevronDown size={14} className="text-slate-400" /> : <ChevronRight size={14} className="text-slate-400" />}
+                                                                <span className="font-medium text-white text-sm">{agent.display_name} Agent</span>
+                                                                <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${agentStatusColor(agent.status)}`}>
+                                                                    {agent.status}
+                                                                </span>
+                                                                {hasPending && (
+                                                                    <span className="text-xs px-2 py-0.5 rounded-full bg-yellow-500/15 text-yellow-400 border border-yellow-500/30 flex items-center gap-1">
+                                                                        <AlertCircle size={10} /> {agent.pending_questions_count} question{agent.pending_questions_count > 1 ? "s" : ""}
+                                                                    </span>
+                                                                )}
+                                                            </div>
+                                                            <div className="flex items-center gap-3 shrink-0">
+                                                                {agent.scenarios_count > 0 && (
+                                                                    <span className="text-xs text-emerald-400">{agent.scenarios_count} scenarios</span>
+                                                                )}
+                                                                <button
+                                                                    onClick={async e => { e.stopPropagation(); if (selectedPlan) { await generateAgentScenarios(selectedPlan.id, agent.module); await loadAgents(selectedPlan.id); } }}
+                                                                    className="text-xs px-2 py-1 bg-purple-500/10 hover:bg-purple-500/20 text-purple-300 rounded transition-colors"
+                                                                    title="Generate scenarios for this module"
+                                                                >
+                                                                    <Brain size={11} />
+                                                                </button>
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Expanded: questions + knowledge */}
+                                                        {isExpanded && (
+                                                            <div className="border-t border-white/5 p-3 space-y-3">
+                                                                {/* Purpose */}
+                                                                {agent.knowledge.purpose && (
+                                                                    <p className="text-xs text-slate-400 italic">{agent.knowledge.purpose}</p>
+                                                                )}
+
+                                                                {/* Pending questions */}
+                                                                {agent.questions.filter(q => q.status === "pending").map(q => (
+                                                                    <div key={q.id} className="bg-yellow-500/8 border border-yellow-500/20 rounded-lg p-3 space-y-2">
+                                                                        <div className="flex items-start gap-2">
+                                                                            <AlertCircle size={13} className="text-yellow-400 mt-0.5 shrink-0" />
+                                                                            <p className="text-sm text-white">{q.question}</p>
+                                                                        </div>
+                                                                        {q.context && <p className="text-xs text-slate-500 ml-5">{q.context}</p>}
+
+                                                                        {/* Quick-pick options */}
+                                                                        {q.options.length > 0 && (
+                                                                            <div className="flex flex-wrap gap-1.5 ml-5">
+                                                                                {q.options.map((opt, i) => (
+                                                                                    <button
+                                                                                        key={i}
+                                                                                        onClick={() => handleAnswerQuestion(agent.module, q.id, opt)}
+                                                                                        className="text-xs px-2.5 py-1 bg-white/5 hover:bg-yellow-500/15 border border-white/10 hover:border-yellow-500/30 text-slate-300 hover:text-yellow-300 rounded-full transition-colors"
+                                                                                    >
+                                                                                        {opt}
+                                                                                    </button>
+                                                                                ))}
+                                                                            </div>
+                                                                        )}
+
+                                                                        {/* Custom text answer */}
+                                                                        <div className="flex gap-2 ml-5">
+                                                                            <input
+                                                                                type="text"
+                                                                                placeholder="Type a custom answer..."
+                                                                                value={agentAnswers[q.id] || ""}
+                                                                                onChange={e => setAgentAnswers(prev => ({ ...prev, [q.id]: e.target.value }))}
+                                                                                onKeyDown={e => { if (e.key === "Enter" && agentAnswers[q.id]?.trim()) handleAnswerQuestion(agent.module, q.id, agentAnswers[q.id]); }}
+                                                                                className="flex-1 px-2.5 py-1.5 bg-[#1a1a1d] border border-white/10 rounded-lg text-white text-xs placeholder:text-slate-600 focus:outline-none focus:border-yellow-500/40"
+                                                                            />
+                                                                            <button
+                                                                                onClick={() => { if (agentAnswers[q.id]?.trim()) handleAnswerQuestion(agent.module, q.id, agentAnswers[q.id]); }}
+                                                                                disabled={!agentAnswers[q.id]?.trim()}
+                                                                                className="px-3 py-1.5 bg-yellow-500/20 hover:bg-yellow-500/30 text-yellow-300 text-xs rounded-lg transition-colors disabled:opacity-40"
+                                                                            >
+                                                                                <Send size={11} />
+                                                                            </button>
+                                                                            <button
+                                                                                onClick={() => handleSkipQuestion(agent.module, q.id)}
+                                                                                className="px-2.5 py-1.5 bg-white/5 hover:bg-white/10 text-slate-500 text-xs rounded-lg transition-colors"
+                                                                                title="Skip this question"
+                                                                            >
+                                                                                Skip
+                                                                            </button>
+                                                                        </div>
+                                                                    </div>
+                                                                ))}
+
+                                                                {/* Answered questions summary */}
+                                                                {agent.questions.filter(q => q.status === "answered").length > 0 && (
+                                                                    <div className="space-y-1">
+                                                                        <p className="text-xs font-semibold text-slate-500 uppercase">Answered</p>
+                                                                        {agent.questions.filter(q => q.status === "answered").map(q => (
+                                                                            <div key={q.id} className="flex items-start gap-2 text-xs">
+                                                                                <CheckCircle size={11} className="text-emerald-400 mt-0.5 shrink-0" />
+                                                                                <span className="text-slate-400 truncate">{q.question}</span>
+                                                                                <span className="text-emerald-400 shrink-0 ml-auto">{q.answer}</span>
+                                                                            </div>
+                                                                        ))}
+                                                                    </div>
+                                                                )}
+
+                                                                {/* Business rules & edge cases */}
+                                                                {agent.knowledge.business_rules.length > 0 && (
+                                                                    <div className="space-y-1">
+                                                                        <p className="text-xs font-semibold text-slate-500 uppercase">Business Rules</p>
+                                                                        {agent.knowledge.business_rules.slice(0, 3).map((rule, i) => (
+                                                                            <p key={i} className="text-xs text-slate-500 flex items-start gap-1.5">
+                                                                                <span className="text-indigo-400 shrink-0">›</span>{rule}
+                                                                            </p>
+                                                                        ))}
+                                                                    </div>
+                                                                )}
+
+                                                                {/* Generated scenarios preview */}
+                                                                {agent.scenarios_count > 0 && (
+                                                                    <div className="space-y-1">
+                                                                        <p className="text-xs font-semibold text-slate-500 uppercase">{agent.scenarios_count} Generated Scenarios</p>
+                                                                        {agent.scenarios.slice(0, 4).map((sc: any) => (
+                                                                            <div key={sc.id} className="flex items-center gap-2 text-xs px-2 py-1 bg-white/5 rounded">
+                                                                                {getTypeIcon(sc.type)}
+                                                                                <span className="text-slate-300 truncate">{sc.name}</span>
+                                                                                <span className={`ml-auto shrink-0 ${getPriorityColor(sc.priority)}`}>{sc.priority}</span>
+                                                                            </div>
+                                                                        ))}
+                                                                        {agent.scenarios_count > 4 && (
+                                                                            <p className="text-xs text-slate-600 pl-2">+{agent.scenarios_count - 4} more scenarios</p>
+                                                                        )}
+                                                                    </div>
+                                                                )}
+
+                                                                {/* Feed Knowledge */}
+                                                                <div className="border-t border-white/5 pt-3">
+                                                                    <div className="flex items-center justify-between mb-2">
+                                                                        <span className="text-xs font-semibold text-slate-500 uppercase flex items-center gap-1.5">
+                                                                            <Brain size={10} className="text-indigo-400" /> Feed Knowledge
+                                                                        </span>
+                                                                        <button
+                                                                            onClick={() => setAgentFeedExpanded(prev => {
+                                                                                const s = new Set(prev);
+                                                                                s.has(agent.module) ? s.delete(agent.module) : s.add(agent.module);
+                                                                                return s;
+                                                                            })}
+                                                                            className="text-xs text-indigo-400 hover:text-indigo-300 flex items-center gap-1"
+                                                                        >
+                                                                            {agentFeedExpanded.has(agent.module) ? <><ChevronUp size={11} /> hide</> : <><ChevronDown size={11} /> add knowledge</>}
+                                                                        </button>
+                                                                    </div>
+                                                                    {agentFeedExpanded.has(agent.module) && (
+                                                                        <div className="space-y-2">
+                                                                            <textarea
+                                                                                value={agentFeedTexts[agent.module] || ""}
+                                                                                onChange={e => setAgentFeedTexts(prev => ({ ...prev, [agent.module]: e.target.value }))}
+                                                                                placeholder={`Paste any business rules, user stories, or requirements for the ${agent.display_name} module…`}
+                                                                                rows={3}
+                                                                                className="w-full px-2.5 py-2 bg-[#1a1a1d] border border-indigo-500/20 rounded-lg text-white text-xs font-mono placeholder:text-slate-600 focus:outline-none focus:border-indigo-500/50 resize-none"
+                                                                            />
+                                                                            <button
+                                                                                onClick={() => handleFeedAgentKnowledge(agent.module)}
+                                                                                disabled={agentFeedLoading[agent.module] || !agentFeedTexts[agent.module]?.trim()}
+                                                                                className="w-full py-1.5 bg-indigo-500/15 hover:bg-indigo-500/25 text-indigo-300 text-xs font-medium rounded-lg transition-colors disabled:opacity-40 flex items-center justify-center gap-1.5"
+                                                                            >
+                                                                                {agentFeedLoading[agent.module] ? <><Loader2 size={11} className="animate-spin" /> Training agent...</> : <><Brain size={11} /> Train This Agent</>}
+                                                                            </button>
+                                                                        </div>
+                                                                    )}
+                                                                </div>
+
+                                                                {/* Agent error */}
+                                                                {agent.error && (
+                                                                    <p className="text-xs text-red-400 bg-red-500/10 rounded p-2">{agent.error}</p>
+                                                                )}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                );
+                                            })}
+
+                                            {/* Total summary */}
+                                            <div className="flex items-center justify-between text-xs text-slate-500 pt-1 border-t border-white/5">
+                                                <span>{agents.length} agents total</span>
+                                                <span>{agents.reduce((acc, a) => acc + a.scenarios_count, 0)} scenarios generated</span>
+                                                <span>{agents.filter(a => a.pending_questions_count > 0).length} awaiting answers</span>
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
                         </div>
                     )}
                 </div>
@@ -992,6 +1582,15 @@ export default function ScenariosPage() {
                                             <h3 className="font-semibold text-white">{mod.name} Module</h3>
                                             {mod.requires_auth && <span className="px-2 py-0.5 text-xs bg-yellow-500/10 text-yellow-400 rounded">Auth</span>}
                                             <span className="text-sm text-slate-500">{mod.scenarios.length} scenarios</span>
+                                            {(() => {
+                                                const agent = agents.find(a => a.module.toLowerCase() === modName.toLowerCase() || a.display_name.toLowerCase() === mod.name.toLowerCase());
+                                                if (!agent) return null;
+                                                return (
+                                                    <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${agentStatusColor(agent.status)}`}>
+                                                        AI Agent · {agent.status}
+                                                    </span>
+                                                );
+                                            })()}
                                         </div>
                                         <div className="flex gap-2">
                                             <button onClick={e => { e.stopPropagation(); selectAllInModule(modName); }} className="px-2 py-1 text-xs bg-white/5 hover:bg-white/10 text-slate-300 rounded">
@@ -1125,6 +1724,33 @@ export default function ScenariosPage() {
                                                     <div className="text-red-400">{r.error}</div>
                                                 </div>
                                             ))}
+                                        </div>
+                                    )}
+
+                                    {/* Self-Healing summary */}
+                                    {healSummary && healSummary.total_healed > 0 && (
+                                        <div className="mt-3 pt-3 border-t border-white/5">
+                                            <div className="flex items-center gap-2 mb-2">
+                                                <Zap size={13} className="text-emerald-400" />
+                                                <span className="text-xs font-semibold text-emerald-400">
+                                                    {healSummary.total_healed} selector{healSummary.total_healed > 1 ? "s" : ""} self-healed
+                                                </span>
+                                            </div>
+                                            <div className="space-y-1.5">
+                                                {healSummary.heals.slice(0, 4).map((h: any, i: number) => (
+                                                    <div key={i} className="bg-emerald-500/5 border border-emerald-500/15 rounded p-2 text-xs">
+                                                        <div className="text-slate-400 mb-0.5 truncate">Scenario: <span className="text-white">{h.scenario_name || h.scenario_id}</span></div>
+                                                        <div className="flex items-center gap-1 text-slate-500 font-mono">
+                                                            <span className="text-red-400 line-through truncate max-w-[40%]">{h.old_selector}</span>
+                                                            <span>→</span>
+                                                            <span className="text-emerald-400 truncate max-w-[40%]">{h.new_selector}</span>
+                                                        </div>
+                                                    </div>
+                                                ))}
+                                                {healSummary.heals.length > 4 && (
+                                                    <p className="text-xs text-slate-600">+{healSummary.heals.length - 4} more heals</p>
+                                                )}
+                                            </div>
                                         </div>
                                     )}
                                 </div>

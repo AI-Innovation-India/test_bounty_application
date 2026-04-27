@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import {
     LayoutDashboard, Brain, List, Activity, Settings,
-    User, Trash2, Target, PlayCircle
+    User, Trash2, Target, PlayCircle, Bot
 } from "lucide-react";
 import { deleteAllRuns } from "@/lib/api";
 
@@ -51,6 +51,13 @@ export default function Sidebar() {
                 {/* AI Testing */}
                 <div>
                     <div className="text-xs font-semibold text-slate-600 mb-1.5 px-2 tracking-widest uppercase">AI Testing</div>
+                    <NavItem
+                        icon={<Bot size={16} />}
+                        label="Autonomous"
+                        href="/autonomous"
+                        active={isActive("/autonomous")}
+                        badge="NEW"
+                    />
                     <NavItem
                         icon={<Brain size={16} />}
                         label="Scenarios"

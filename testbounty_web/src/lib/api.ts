@@ -15,7 +15,7 @@ export interface Run {
     extra_info?: string;
 }
 
-const API_BASE = 'http://localhost:8000/api';
+const API_BASE = 'http://localhost:8001/api';
 
 export async function startRun(input: {
     project_path?: string;
@@ -368,14 +368,23 @@ export async function cancelPlan(planId: string): Promise<{ status: string; plan
     return res.json();
 }
 
+export interface TestCredentials {
+    username: string;
+    password: string;
+}
+
 export async function runScenarios(
     planId: string,
-    scenarioIds: string[] = []
+    scenarioIds: string[] = [],
+    credentials?: TestCredentials
 ): Promise<{ run_id: string; status: string; scenarios_count: number }> {
     const res = await fetch(`${API_BASE}/plans/${planId}/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ scenario_ids: scenarioIds }),
+        body: JSON.stringify({
+            scenario_ids: scenarioIds,
+            ...(credentials ? { test_credentials: credentials } : {}),
+        }),
     });
     if (!res.ok) throw new Error('Failed to run scenarios');
     return res.json();
@@ -383,12 +392,16 @@ export async function runScenarios(
 
 export async function runModule(
     planId: string,
-    moduleName: string
+    moduleName: string,
+    credentials?: TestCredentials
 ): Promise<{ run_id: string; status: string; scenarios_count: number }> {
     const res = await fetch(`${API_BASE}/plans/${planId}/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ module: moduleName }),
+        body: JSON.stringify({
+            module: moduleName,
+            ...(credentials ? { test_credentials: credentials } : {}),
+        }),
     });
     if (!res.ok) throw new Error('Failed to run module');
     return res.json();
@@ -522,6 +535,8 @@ export interface SessionRecord {
     created_at: string;
     stopped_at: string | null;
     error: string | null;
+    recording_paused?: boolean;
+    app_domain?: string;
 }
 
 export async function startSessionRecord(url: string, planId?: string): Promise<{ session_id: string; status: string; url: string }> {
@@ -563,6 +578,177 @@ export async function listSkills(): Promise<{ skills: SkillInfo[] }> {
 export async function getActiveSkills(planId: string): Promise<{ plan_id: string; domain: string; active_skills: string[] }> {
     const res = await fetch(`${API_BASE}/plans/${planId}/active-skills`);
     if (!res.ok) throw new Error('Failed to fetch active skills');
+    return res.json();
+}
+
+// =============================================
+// MULTI-AGENT SYSTEM API
+// =============================================
+
+export interface AgentQuestion {
+    id: string;
+    agent_id: string;
+    module: string;
+    question: string;
+    context: string;
+    options: string[];
+    answer: string | null;
+    asked_at: string;
+    answered_at: string;
+    status: 'pending' | 'answered' | 'skipped';
+}
+
+export interface ModuleAgent {
+    agent_id: string;
+    module: string;
+    display_name: string;
+    status: 'idle' | 'exploring' | 'questioning' | 'generating' | 'ready' | 'running' | 'done' | 'failed';
+    plan_id: string;
+    base_url: string;
+    depends_on: string | null;
+    knowledge: {
+        module: string;
+        base_url: string;
+        entry_url: string;
+        page_title: string;
+        purpose: string;
+        key_elements: { selector: string; label: string; type: string; purpose: string }[];
+        business_rules: string[];
+        valid_data: Record<string, string>;
+        invalid_data: Record<string, string>;
+        edge_cases: string[];
+        security_concerns: string[];
+        qa_pairs: Record<string, string>;
+    };
+    scenarios_count: number;
+    scenarios: any[];
+    questions: AgentQuestion[];
+    pending_questions_count: number;
+    results: Record<string, any>;
+    created_at: string;
+    error: string | null;
+}
+
+export async function createPlanAgents(planId: string, modules?: string[]): Promise<{
+    status: string; plan_id: string; agents_count: number; agents: ModuleAgent[];
+}> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/agents/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ modules: modules || null }),
+    });
+    if (!res.ok) throw new Error('Failed to create agents');
+    return res.json();
+}
+
+export async function listPlanAgents(planId: string): Promise<{
+    plan_id: string; agents_count: number; agents: ModuleAgent[];
+}> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/agents`);
+    if (!res.ok) throw new Error('Failed to list agents');
+    return res.json();
+}
+
+export async function getPlanAgent(planId: string, module: string): Promise<ModuleAgent> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/agents/${module}`);
+    if (!res.ok) throw new Error('Agent not found');
+    return res.json();
+}
+
+export async function exploreAgentModule(planId: string, module: string): Promise<{ status: string; agent_id: string }> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/agents/${module}/explore`, { method: 'POST' });
+    if (!res.ok) throw new Error('Failed to start exploration');
+    return res.json();
+}
+
+export async function answerAgentQuestion(planId: string, module: string, questionId: string, answer: string): Promise<{
+    status: string; pending_questions: number; agent_status: string;
+}> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/agents/${module}/answer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question_id: questionId, answer }),
+    });
+    if (!res.ok) throw new Error('Failed to answer question');
+    return res.json();
+}
+
+export async function skipAgentQuestion(planId: string, module: string, questionId: string): Promise<{
+    status: string; pending_questions: number; agent_status: string;
+}> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/agents/${module}/skip`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question_id: questionId }),
+    });
+    if (!res.ok) throw new Error('Failed to skip question');
+    return res.json();
+}
+
+export async function generateAgentScenarios(planId: string, module: string): Promise<{
+    status: string; module: string; scenarios_count: number; scenarios: any[];
+}> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/agents/${module}/generate`, { method: 'POST' });
+    if (!res.ok) throw new Error('Failed to generate scenarios');
+    return res.json();
+}
+
+export async function generateAllAgentScenarios(planId: string): Promise<{
+    status: string; plan_id: string; results: Record<string, { status: string; count?: number; error?: string }>;
+}> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/agents/generate-all`, { method: 'POST' });
+    if (!res.ok) throw new Error('Failed to generate all scenarios');
+    return res.json();
+}
+
+export async function mergeAgentScenarios(planId: string): Promise<{
+    status: string; plan_id: string; scenarios_added: number; total_scenarios: number;
+}> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/agents/merge`, { method: 'POST' });
+    if (!res.ok) throw new Error('Failed to merge scenarios');
+    return res.json();
+}
+
+export async function runAgentScenarios(planId: string, credentials?: TestCredentials): Promise<{
+    run_id: string; status: string; scenarios_count: number;
+}> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/agents/run`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            ...(credentials ? { test_credentials: credentials } : {}),
+        }),
+    });
+    if (!res.ok) throw new Error('Failed to run agent scenarios');
+    return res.json();
+}
+
+export async function feedAgentKnowledge(
+    planId: string,
+    module: string,
+    text: string,
+    source: string = 'manual',
+): Promise<{ status: string; module: string; extracted: any; total_rules: number; total_edge_cases: number }> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/agents/${module}/feed-knowledge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, source }),
+    });
+    if (!res.ok) throw new Error('Failed to feed agent knowledge');
+    return res.json();
+}
+
+export async function feedAllAgents(
+    planId: string,
+    text: string,
+    source: string = 'user_story',
+): Promise<{ status: string; routed_to: Array<{ module: string; display_name: string; rules_added: number; edges_added: number }> }> {
+    const res = await fetch(`${API_BASE}/plans/${planId}/agents/feed-all`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, source }),
+    });
+    if (!res.ok) throw new Error('Failed to feed agents');
     return res.json();
 }
 
@@ -621,4 +807,56 @@ export const api = {
     // Skills
     listSkills,
     getActiveSkills,
+
+    // Multi-Agent System
+    createPlanAgents,
+    listPlanAgents,
+    getPlanAgent,
+    exploreAgentModule,
+    answerAgentQuestion,
+    skipAgentQuestion,
+    generateAgentScenarios,
+    generateAllAgentScenarios,
+    mergeAgentScenarios,
+    runAgentScenarios,
+    feedAgentKnowledge,
+    feedAllAgents,
+
+    // Autonomous Explorer
+    startAutonomousSession,
+    getAutonomousStatus,
+    answerAutonomousQuestion,
+    deleteAutonomousSession,
 };
+
+// ── Autonomous Explorer ────────────────────────────────────────────────────────
+
+export const WS_BASE = 'ws://localhost:8001';
+
+export async function startAutonomousSession(url: string, maxPages = 25): Promise<{ session_id: string; status: string }> {
+    const res = await fetch(`${API_BASE}/autonomous/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, max_pages: maxPages }),
+    });
+    if (!res.ok) throw new Error('Failed to start autonomous session');
+    return res.json();
+}
+
+export async function getAutonomousStatus(sessionId: string): Promise<any> {
+    const res = await fetch(`${API_BASE}/autonomous/${sessionId}/status`);
+    if (!res.ok) throw new Error('Session not found');
+    return res.json();
+}
+
+export async function answerAutonomousQuestion(sessionId: string, answer: string): Promise<void> {
+    await fetch(`${API_BASE}/autonomous/${sessionId}/answer`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ answer }),
+    });
+}
+
+export async function deleteAutonomousSession(sessionId: string): Promise<void> {
+    await fetch(`${API_BASE}/autonomous/${sessionId}`, { method: 'DELETE' });
+}

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, BackgroundTasks, HTTPException, UploadFile, File, Form, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import asyncio
@@ -35,15 +35,15 @@ RUNS_FILE = Path("runs.json")
 def load_runs():
     if RUNS_FILE.exists():
         try:
-            with open(RUNS_FILE, "r") as f:
+            with open(RUNS_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except:
             return {}
     return {}
 
 def save_runs():
-    with open(RUNS_FILE, "w") as f:
-        json.dump(RUNS, f, indent=2)
+    with open(RUNS_FILE, "w", encoding="utf-8") as f:
+        json.dump(RUNS, f, indent=2, ensure_ascii=False)
 
 # Load on startup
 RUNS = load_runs()
@@ -1218,9 +1218,11 @@ async def run_exploration_task(
         )
 
     except Exception as e:
-        logger.error(f"[{explore_id}] Exploration failed: {e}")
+        import traceback
+        err_msg = str(e) or type(e).__name__
+        logger.error(f"[{explore_id}] Exploration failed: {err_msg}\n{traceback.format_exc()}")
         PLANS[explore_id]["status"] = "failed"
-        PLANS[explore_id]["error"] = str(e)
+        PLANS[explore_id]["error"] = err_msg or f"Unexpected error ({type(e).__name__})"
         save_plans(PLANS)
 
 
@@ -1352,41 +1354,49 @@ async def run_plan_scenarios(plan_id: str, request: RunScenariosRequest, backgro
 def apply_credentials_to_scenarios(scenarios: List[Dict], credentials: Dict) -> List[Dict]:
     """
     Replace placeholder credentials in scenarios with real credentials.
-    This allows users to provide actual login credentials to override generated test data.
+    Handles: LLM-generated placeholders, Shadow Mode [PASSWORD] mask,
+    and Azure B2C / SSO field selectors.
     """
     import copy
 
-    # Common placeholder patterns to replace
-    placeholder_emails = [
+    _EMAIL_PLACEHOLDERS = {
         "testuser@example.com", "user@example.com", "test@test.com",
-        "admin@example.com", "demo@demo.com"
-    ]
-    placeholder_passwords = [
+        "admin@example.com", "demo@demo.com", "user@thermoking.com",
+        "{{username}}", "{{email}}", "<username>", "<email>",
+    }
+    _PASSWORD_PLACEHOLDERS = {
         "TestPassword123!", "password123", "Password123!",
-        "test123", "admin123"
+        "test123", "admin123", "[PASSWORD]", "{{password}}",
+        "<password>", "YourPassword123!",
+    }
+    # Selectors that indicate a username/email field (covers SSO providers)
+    _USERNAME_SELECTOR_SIGNALS = [
+        "email", "username", "user", "login", "loginfmt", "i0116",
+        "accountname", "userid",
+    ]
+    # Selectors that indicate a password field
+    _PASSWORD_SELECTOR_SIGNALS = [
+        "password", "passwd", "pass", "pwd", "i0118",
     ]
 
     updated_scenarios = copy.deepcopy(scenarios)
 
     for scenario in updated_scenarios:
-        # Only apply to login-related scenarios
-        scenario_name = scenario.get("name", "").lower()
-        if "login" in scenario_name or "sign in" in scenario_name or "auth" in scenario_name:
-            for step in scenario.get("steps", []):
-                if step.get("action") == "fill":
-                    # Check if this is an email/username field
-                    target = step.get("target", "").lower()
-                    value = step.get("value", "")
+        for step in scenario.get("steps", []):
+            if step.get("action") != "fill":
+                continue
+            target = step.get("target", "").lower()
+            value = step.get("value", "") or ""
 
-                    # Replace placeholder email with real username
-                    if any(field in target for field in ["email", "username", "user", "login"]):
-                        if value in placeholder_emails:
-                            step["value"] = credentials.get("username", value)
+            is_username_field = any(sig in target for sig in _USERNAME_SELECTOR_SIGNALS)
+            is_password_field = any(sig in target for sig in _PASSWORD_SELECTOR_SIGNALS)
 
-                    # Replace placeholder password with real password
-                    if "password" in target:
-                        if value in placeholder_passwords:
-                            step["value"] = credentials.get("password", value)
+            # Replace if value is a known placeholder OR if field type is detected
+            # Value-first matching catches SSO fields like #signInName, #loginfmt etc.
+            if value in _EMAIL_PLACEHOLDERS or (is_username_field and not value):
+                step["value"] = credentials.get("username", value)
+            elif value in _PASSWORD_PLACEHOLDERS or (is_password_field and not value):
+                step["value"] = credentials.get("password", value)
 
     return updated_scenarios
 
@@ -1521,58 +1531,74 @@ def run_scenarios_task_sync(run_id: str, base_url: str, scenarios: List[Dict], b
             else:  # Default to chromium
                 browser = p.chromium.launch(headless=True)
 
-            # Check if we need to login first
+            # ── POM-style execution: login once, share session ─────────────────
+            # Find the login/auth scenario (the one that others depend on)
+            all_dep_ids = {s["depends_on"] for s in scenarios if s.get("depends_on")}
             auth_scenario = None
-            for s in scenarios:
-                if s.get("depends_on"):
-                    # Find the auth scenario
-                    auth_scenario = next(
-                        (sc for sc in scenarios if sc["id"] == s["depends_on"]),
-                        None
-                    )
+            for dep_id in all_dep_ids:
+                auth_scenario = next((s for s in scenarios if s["id"] == dep_id), None)
+                if auth_scenario:
                     break
 
-            # Run auth scenario first if needed (separate context for video)
+            # Storage for shared authenticated contexts: dep_id → browser context
+            shared_contexts: Dict[str, Any] = {}
+
+            # Step 1: Run auth prerequisite scenarios first, keep context alive
             if auth_scenario:
-                context = browser.new_context(
+                shared_context = browser.new_context(
                     viewport={'width': 1280, 'height': 720},
                     record_video_dir=f"./temp_runs/{run_id}/videos/{auth_scenario['id']}"
                 )
-                page = context.new_page()
-                result = execute_scenario_sync(page, auth_scenario, base_url, healer)
+                auth_page = shared_context.new_page()
+                result = execute_scenario_sync(auth_page, auth_scenario, base_url, healer)
                 results[auth_scenario["id"]] = result
-                page.close()
-                context.close()
+                # Keep context alive — other scenarios share this authenticated session
+                shared_contexts[auth_scenario["id"]] = shared_context
+                # Don't close auth_page — it holds the session cookies
 
-            # Run each scenario in its own context for separate video recording
+            # Step 2: Run all other scenarios
             for scenario in scenarios:
                 if scenario.get("id") == (auth_scenario["id"] if auth_scenario else None):
-                    continue  # Already ran auth
+                    continue  # auth already ran
 
-                # Create new context for each scenario to get separate video
-                context = browser.new_context(
-                    viewport={'width': 1280, 'height': 720},
-                    record_video_dir=f"./temp_runs/{run_id}/videos/{scenario['id']}"
-                )
-                page = context.new_page()
+                dep_id = scenario.get("depends_on")
+                if dep_id and dep_id in shared_contexts:
+                    # Reuse the authenticated context — open a new page in same session
+                    ctx = shared_contexts[dep_id]
+                    page = ctx.new_page()
+                    try:
+                        result = execute_scenario_sync(page, scenario, base_url, healer)
+                        results[scenario["id"]] = result
+                        RUNS[run_id]["results"] = results
+                        save_runs()
+                    except Exception as e:
+                        results[scenario["id"]] = {"status": "failed", "error": str(e)}
+                    finally:
+                        page.close()
+                else:
+                    # No dependency — fresh context with its own video
+                    context = browser.new_context(
+                        viewport={'width': 1280, 'height': 720},
+                        record_video_dir=f"./temp_runs/{run_id}/videos/{scenario['id']}"
+                    )
+                    page = context.new_page()
+                    try:
+                        result = execute_scenario_sync(page, scenario, base_url, healer)
+                        results[scenario["id"]] = result
+                        RUNS[run_id]["results"] = results
+                        save_runs()
+                    except Exception as e:
+                        results[scenario["id"]] = {"status": "failed", "error": str(e)}
+                    finally:
+                        page.close()
+                        context.close()
 
+            # Close shared contexts last
+            for ctx in shared_contexts.values():
                 try:
-                    result = execute_scenario_sync(page, scenario, base_url, healer)
-                    results[scenario["id"]] = result
-
-                    # Update progress
-                    RUNS[run_id]["results"] = results
-                    save_runs()
-
-                except Exception as e:
-                    results[scenario["id"]] = {
-                        "status": "failed",
-                        "error": str(e)
-                    }
-
-                finally:
-                    page.close()
-                    context.close()
+                    ctx.close()
+                except Exception:
+                    pass
 
             browser.close()
 
@@ -1592,6 +1618,10 @@ def run_scenarios_task_sync(run_id: str, base_url: str, scenarios: List[Dict], b
 def execute_scenario_sync(page, scenario: Dict, base_url: str, healer=None) -> Dict:
     """Synchronous version for Windows - Execute a single test scenario and return results."""
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
+    from src.utils.page_intelligence import (
+        dismiss_overlays_sync, smart_find_sync,
+        vision_find_sync, vision_dismiss_overlays_sync,
+    )
 
     scenario_result = {
         "id": scenario["id"],
@@ -1609,8 +1639,6 @@ def execute_scenario_sync(page, scenario: Dict, base_url: str, healer=None) -> D
 
             if action == "navigate":
                 url = target if target.startswith("http") else f"{base_url}{target}"
-                # If URL is an SSO/OAuth provider, navigate to app base URL instead
-                # and let the natural redirect chain handle the auth flow
                 _SSO_DOMAINS = (
                     "b2clogin.com", "login.microsoftonline.com", "accounts.microsoft.com",
                     "okta.com", "auth0.com", "onelogin.com", "accounts.google.com",
@@ -1621,14 +1649,20 @@ def execute_scenario_sync(page, scenario: Dict, base_url: str, healer=None) -> D
                     page.goto(url, wait_until="domcontentloaded", timeout=30000)
                     page.wait_for_load_state("networkidle", timeout=10000)
                 except Exception:
-                    pass  # networkidle timeout is non-fatal — page is loaded enough
+                    pass
+                # Layer 1: pattern-based consent dismiss
+                dismissed = dismiss_overlays_sync(page, timeout_ms=3000)
+                # Layer 4: if pattern didn't find it, try vision
+                if not dismissed:
+                    vision_dismiss_overlays_sync(page)
 
             elif action == "fill":
-                selectors = target.split(", ")
+                step_desc = step.get("description", target)
+                selectors = [s.strip() for s in target.split(",") if s.strip()]
                 filled = False
                 for selector in selectors:
                     try:
-                        elem = page.wait_for_selector(selector.strip(), state="visible", timeout=8000)
+                        elem = page.wait_for_selector(selector, state="visible", timeout=5000)
                         if elem:
                             elem.scroll_into_view_if_needed()
                             elem.fill(value or "")
@@ -1636,15 +1670,16 @@ def execute_scenario_sync(page, scenario: Dict, base_url: str, healer=None) -> D
                             break
                     except:
                         continue
+
                 if not filled:
+                    # Layer 2: healer (LLM-based)
                     if healer:
                         html = page.content()
                         healed_step = healer.heal_selector(step, html, page.url)
                         if healed_step:
-                            new_selectors = healed_step["target"].split(", ")
-                            for sel in new_selectors:
+                            for sel in healed_step["target"].split(", "):
                                 try:
-                                    elem = page.wait_for_selector(sel.strip(), state="visible", timeout=8000)
+                                    elem = page.wait_for_selector(sel.strip(), state="visible", timeout=5000)
                                     if elem:
                                         elem.scroll_into_view_if_needed()
                                         elem.fill(value or "")
@@ -1653,15 +1688,47 @@ def execute_scenario_sync(page, scenario: Dict, base_url: str, healer=None) -> D
                                         break
                                 except:
                                     continue
-                    if not filled:
-                        raise Exception(f"Could not find element: {target}")
+
+                if not filled:
+                    # Layer 3: DOM intelligence — scan live page using step description as intent
+                    smart_sel = smart_find_sync(page, step_desc, "fill")
+                    if smart_sel:
+                        try:
+                            elem = page.wait_for_selector(smart_sel, state="visible", timeout=5000)
+                            if elem:
+                                elem.scroll_into_view_if_needed()
+                                elem.fill(value or "")
+                                filled = True
+                                step["target"] = smart_sel
+                                print(f"[Executor] L3-healed fill: '{step_desc}' → {smart_sel}")
+                        except:
+                            pass
+
+                if not filled:
+                    # Layer 4: Vision — screenshot → AI finds element by coordinates
+                    coords = vision_find_sync(page, step_desc)
+                    if coords:
+                        try:
+                            page.mouse.click(*coords)          # focus the field
+                            page.wait_for_timeout(150)
+                            page.keyboard.select_all()         # clear existing content
+                            page.keyboard.type(value or "")    # type the value
+                            filled = True
+                            step["target"] = f"vision:({coords[0]},{coords[1]})"
+                            print(f"[Executor] L4-vision fill: '{step_desc}' → {coords}")
+                        except Exception as ve:
+                            print(f"[Executor] L4-vision fill failed: {ve}")
+
+                if not filled:
+                    raise Exception(f"Could not find element: {target}")
 
             elif action == "click":
-                selectors = target.split(", ")
+                step_desc = step.get("description", target)
+                selectors = [s.strip() for s in target.split(",") if s.strip()]
                 clicked = False
                 for selector in selectors:
                     try:
-                        elem = page.wait_for_selector(selector.strip(), state="visible", timeout=8000)
+                        elem = page.wait_for_selector(selector, state="visible", timeout=5000)
                         if elem:
                             elem.scroll_into_view_if_needed()
                             elem.click()
@@ -1669,15 +1736,16 @@ def execute_scenario_sync(page, scenario: Dict, base_url: str, healer=None) -> D
                             break
                     except:
                         continue
+
                 if not clicked:
+                    # Layer 2: healer
                     if healer:
                         html = page.content()
                         healed_step = healer.heal_selector(step, html, page.url)
                         if healed_step:
-                            new_selectors = healed_step["target"].split(", ")
-                            for sel in new_selectors:
+                            for sel in healed_step["target"].split(", "):
                                 try:
-                                    elem = page.wait_for_selector(sel.strip(), state="visible", timeout=8000)
+                                    elem = page.wait_for_selector(sel.strip(), state="visible", timeout=5000)
                                     if elem:
                                         elem.scroll_into_view_if_needed()
                                         elem.click()
@@ -1686,8 +1754,36 @@ def execute_scenario_sync(page, scenario: Dict, base_url: str, healer=None) -> D
                                         break
                                 except:
                                     continue
-                    if not clicked:
-                        raise Exception(f"Could not click element: {target}")
+
+                if not clicked:
+                    # Layer 3: DOM intelligence
+                    smart_sel = smart_find_sync(page, step_desc, "click")
+                    if smart_sel:
+                        try:
+                            elem = page.wait_for_selector(smart_sel, state="visible", timeout=5000)
+                            if elem:
+                                elem.scroll_into_view_if_needed()
+                                elem.click()
+                                clicked = True
+                                step["target"] = smart_sel
+                                print(f"[Executor] L3-healed click: '{step_desc}' → {smart_sel}")
+                        except:
+                            pass
+
+                if not clicked:
+                    # Layer 4: Vision — screenshot → AI finds element by coordinates
+                    coords = vision_find_sync(page, step_desc)
+                    if coords:
+                        try:
+                            page.mouse.click(*coords)
+                            clicked = True
+                            step["target"] = f"vision:({coords[0]},{coords[1]})"
+                            print(f"[Executor] L4-vision click: '{step_desc}' → {coords}")
+                        except Exception as ve:
+                            print(f"[Executor] L4-vision click failed: {ve}")
+
+                if not clicked:
+                    raise Exception(f"Could not click element: {target}")
 
             elif action == "wait":
                 if target == "navigation":
@@ -1700,27 +1796,39 @@ def execute_scenario_sync(page, scenario: Dict, base_url: str, healer=None) -> D
                 if target == "page_loaded":
                     assert page.title(), "Page did not load"
                 elif target == "url_changed":
-                    # Check if login actually succeeded by looking for account indicators
                     current_url = page.url
-                    success_indicators = [
-                        ".account", ".header-links a[href*='logout']",
-                        ".header-links a[href*='account']", "[href*='customerinfo']",
-                        "a:has-text('Log out')", "a:has-text('Logout')",
-                        ".ico-logout", "[href*='logout']"
+                    # Auth-related URL patterns — if NOT in any of these, we're on an app page
+                    _AUTH_URL_PATTERNS = [
+                        "login", "logon", "signin", "sign-in", "/auth/",
+                        "b2clogin.com", "login.microsoftonline.com",
+                        "accounts.google.com", "okta.com", "auth0.com",
                     ]
-                    found_success = False
-                    for sel in success_indicators:
-                        try:
-                            elem = page.query_selector(sel)
-                            if elem and elem.is_visible():
-                                found_success = True
-                                break
-                        except:
-                            continue
-                    # If still on login page and no success indicators, fail
-                    if 'login' in current_url.lower() and not found_success:
-                        assert False, "Login failed - still on login page"
-                    assert found_success, "Login success indicators not found"
+                    on_auth_page = any(p in current_url.lower() for p in _AUTH_URL_PATTERNS)
+
+                    if not on_auth_page:
+                        # URL moved away from auth — login succeeded
+                        pass
+                    else:
+                        # Still on an auth page; look for DOM indicators of success
+                        success_indicators = [
+                            ".account", ".user-menu", ".avatar", ".profile",
+                            "[href*='logout']", "[href*='log-out']", "[href*='sign-out']", "[href*='signout']",
+                            ".header-links a[href*='logout']", ".header-links a[href*='account']",
+                            "[href*='customerinfo']", ".ico-logout",
+                            "a:has-text('Log out')", "a:has-text('Logout')", "a:has-text('Sign out')",
+                            "button:has-text('Sign Out')", "button:has-text('Log Out')",
+                            ".sidebar", ".dashboard-content", "[data-user]",
+                        ]
+                        found_success = False
+                        for sel in success_indicators:
+                            try:
+                                elem = page.query_selector(sel)
+                                if elem and elem.is_visible():
+                                    found_success = True
+                                    break
+                            except:
+                                continue
+                        assert found_success, f"Login failed — still on auth page: {current_url}"
                 elif target == "error_message_visible":
                     # Look for common error indicators including ASP.NET MVC validation
                     error_selectors = [
@@ -1763,9 +1871,536 @@ def execute_scenario_sync(page, scenario: Dict, base_url: str, healer=None) -> D
     return scenario_result
 
 
+# =============================================================================
+# MULTI-AGENT SYSTEM — one autonomous agent per application module
+# =============================================================================
+
+from src.agents.module_agent import (
+    ModuleAgent, AgentQuestion,
+    create_agents_for_plan, get_agents_for_plan, get_agent, register_agent,
+)
+
+
+class CreateAgentsRequest(BaseModel):
+    modules: Optional[List[str]] = None  # None = auto-detect from app_map
+
+
+class AnswerQuestionRequest(BaseModel):
+    question_id: str
+    answer: str
+
+
+class SkipQuestionRequest(BaseModel):
+    question_id: str
+
+
+class FeedKnowledgeRequest(BaseModel):
+    text: str
+    source: str = "manual"  # manual | user_story | document | chat
+
+
+@app.post("/api/plans/{plan_id}/agents/{module}/feed-knowledge")
+async def feed_agent_knowledge(plan_id: str, module: str, request: FeedKnowledgeRequest):
+    """
+    Feed raw text (stories, notes, requirements) into a specific agent.
+    Agent extracts business rules, edge cases, and valid/invalid test data.
+    """
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    from src.agents.module_agent import get_agent
+    agent = get_agent(plan_id, module)
+    if not agent:
+        raise HTTPException(status_code=404, detail=f"No agent for module '{module}'")
+
+    extracted = agent.feed_knowledge_from_text(request.text, source=request.source)
+    return {
+        "status": "ok",
+        "module": module,
+        "extracted": extracted,
+        "total_rules": len(agent.knowledge.business_rules),
+        "total_edge_cases": len(agent.knowledge.edge_cases),
+    }
+
+
+@app.post("/api/plans/{plan_id}/agents/feed-all")
+async def feed_all_agents(plan_id: str, request: FeedKnowledgeRequest):
+    """
+    Feed text to ALL agents for the plan, auto-routing to relevant modules.
+    Used by Train AI tab when 'Route to agents' is enabled.
+    """
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    from src.agents.module_agent import get_agents_for_plan, detect_relevant_modules
+    agents_map = get_agents_for_plan(plan_id)
+    if not agents_map:
+        return {"status": "ok", "routed_to": [], "note": "No agents created yet"}
+
+    available = list(agents_map.keys())
+    relevant = detect_relevant_modules(request.text, available)
+
+    results = []
+    for module in relevant:
+        agent = agents_map[module]
+        extracted = agent.feed_knowledge_from_text(request.text, source=request.source)
+        results.append({
+            "module": module,
+            "display_name": agent.display_name,
+            "rules_added": len(extracted["business_rules"]),
+            "edges_added": len(extracted["edge_cases"]),
+        })
+
+    return {"status": "ok", "routed_to": results}
+
+
+@app.post("/api/plans/{plan_id}/agents/create")
+async def create_plan_agents(plan_id: str, request: CreateAgentsRequest, background_tasks: BackgroundTasks):
+    """
+    Create one ModuleAgent per module discovered in the plan.
+    If modules list is provided, use that. Otherwise auto-detect from app_map.
+    """
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    plan = PLANS[plan_id]
+    base_url = plan["url"]
+
+    # Determine modules to create agents for
+    if request.modules:
+        modules = request.modules
+    else:
+        # Auto-detect from app_map or test_plan
+        test_plan = plan.get("test_plan") or {}
+        tp_modules = list(test_plan.get("modules", {}).keys())
+        app_map = plan.get("app_map") or {}
+        am_modules = list(app_map.get("modules", {}).keys())
+        modules = tp_modules or am_modules or ["auth"]
+        # Ensure auth is always present
+        if "auth" not in modules:
+            modules = ["auth"] + modules
+
+    from src.services.llm_service import LLMService
+    llm = LLMService()
+
+    agents = create_agents_for_plan(plan_id, base_url, modules, llm)
+
+    # Raise standard questions for each agent immediately
+    for agent in agents:
+        agent._raise_module_questions()
+
+    return {
+        "status": "created",
+        "plan_id": plan_id,
+        "agents_count": len(agents),
+        "agents": [a.to_dict() for a in agents],
+    }
+
+
+@app.get("/api/plans/{plan_id}/agents")
+async def list_plan_agents(plan_id: str):
+    """List all agents for a plan with their current status."""
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    agents = get_agents_for_plan(plan_id)
+    return {
+        "plan_id": plan_id,
+        "agents_count": len(agents),
+        "agents": [a.to_dict() for a in agents.values()],
+    }
+
+
+@app.get("/api/plans/{plan_id}/agents/{module}")
+async def get_plan_agent(plan_id: str, module: str):
+    """Get the state of a specific module agent."""
+    agent = get_agent(plan_id, module)
+    if not agent:
+        raise HTTPException(status_code=404, detail=f"No agent for module '{module}' in plan '{plan_id}'")
+    return agent.to_dict()
+
+
+@app.post("/api/plans/{plan_id}/agents/{module}/explore")
+async def explore_agent_module(plan_id: str, module: str, background_tasks: BackgroundTasks):
+    """
+    Trigger the agent to explore its module URL, analyse the page,
+    and build knowledge (raises further questions if needed).
+    Runs as a background task.
+    """
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    agent = get_agent(plan_id, module)
+    if not agent:
+        raise HTTPException(status_code=404, detail=f"No agent for module '{module}'")
+
+    background_tasks.add_task(_agent_explore_task, plan_id, module)
+    return {"status": "exploring", "agent_id": agent.agent_id}
+
+
+async def _agent_explore_task(plan_id: str, module: str):
+    """Background: explorer navigates the module URL and feeds DOM info to the agent."""
+    import platform
+    from concurrent.futures import ThreadPoolExecutor
+
+    agent = get_agent(plan_id, module)
+    if not agent:
+        return
+
+    agent.status = "exploring"
+
+    entry_url = agent.knowledge.entry_url or agent.base_url
+
+    try:
+        if platform.system() == "Windows":
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor() as ex:
+                page_info = await loop.run_in_executor(
+                    ex, _scrape_page_info_sync, entry_url
+                )
+        else:
+            page_info = await _scrape_page_info_async(entry_url)
+
+        agent.build_knowledge_from_page(page_info)
+
+    except Exception as e:
+        agent.status = "idle"
+        agent.error = f"Explore failed: {e}"
+        print(f"[{agent.agent_id}] Explore task error: {e}")
+
+
+def _scrape_page_info_sync(url: str) -> Dict:
+    """Scrape a page synchronously and return DOM summary for the agent."""
+    from playwright.sync_api import sync_playwright
+    from src.utils.page_intelligence import dismiss_overlays_sync
+
+    result = {"url": url, "title": "", "forms": [], "inputs": [], "buttons": [], "nav_links": []}
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1280, "height": 720})
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_load_state("networkidle", timeout=8000)
+            dismiss_overlays_sync(page, timeout_ms=2000)
+
+            result["url"] = page.url
+            result["title"] = page.title()
+
+            # Extract inputs
+            inputs = page.eval_on_selector_all(
+                "input:not([type='hidden']), textarea, select",
+                """els => els.slice(0, 20).map(el => ({
+                    selector: el.id ? '#' + el.id : (el.name ? '[name="' + el.name + '"]' : el.tagName.toLowerCase()),
+                    type: el.type || el.tagName.toLowerCase(),
+                    name: el.name || el.id || '',
+                    placeholder: el.placeholder || ''
+                }))"""
+            )
+            result["inputs"] = inputs
+
+            # Extract buttons
+            buttons = page.eval_on_selector_all(
+                "button, input[type='submit'], a[role='button']",
+                """els => els.slice(0, 15).map(el => ({
+                    selector: el.id ? '#' + el.id : el.tagName.toLowerCase(),
+                    text: el.innerText?.trim() || el.value || ''
+                }))"""
+            )
+            result["buttons"] = buttons
+
+            # Extract nav links
+            nav_links = page.eval_on_selector_all(
+                "nav a, header a, [role='navigation'] a",
+                "els => els.slice(0, 20).map(el => ({href: el.href, text: el.innerText?.trim()}))"
+            )
+            result["nav_links"] = nav_links
+
+            browser.close()
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+
+async def _scrape_page_info_async(url: str) -> Dict:
+    """Async version of page scraping."""
+    from playwright.async_api import async_playwright
+    from src.utils.page_intelligence import dismiss_overlays_async
+
+    result = {"url": url, "title": "", "forms": [], "inputs": [], "buttons": [], "nav_links": []}
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={"width": 1280, "height": 720})
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_load_state("networkidle", timeout=8000)
+            await dismiss_overlays_async(page, timeout_ms=2000)
+
+            result["url"] = page.url
+            result["title"] = await page.title()
+
+            inputs = await page.eval_on_selector_all(
+                "input:not([type='hidden']), textarea, select",
+                """els => els.slice(0, 20).map(el => ({
+                    selector: el.id ? '#' + el.id : (el.name ? '[name="' + el.name + '"]' : el.tagName.toLowerCase()),
+                    type: el.type || el.tagName.toLowerCase(),
+                    name: el.name || el.id || '',
+                    placeholder: el.placeholder || ''
+                }))"""
+            )
+            result["inputs"] = inputs
+
+            buttons = await page.eval_on_selector_all(
+                "button, input[type='submit'], a[role='button']",
+                """els => els.slice(0, 15).map(el => ({
+                    selector: el.id ? '#' + el.id : el.tagName.toLowerCase(),
+                    text: el.innerText?.trim() || el.value || ''
+                }))"""
+            )
+            result["buttons"] = buttons
+
+            nav_links = await page.eval_on_selector_all(
+                "nav a, header a, [role='navigation'] a",
+                "els => els.slice(0, 20).map(el => ({href: el.href, text: el.innerText?.trim()}))"
+            )
+            result["nav_links"] = nav_links
+
+            await browser.close()
+    except Exception as e:
+        result["error"] = str(e)
+    return result
+
+
+@app.post("/api/plans/{plan_id}/agents/{module}/answer")
+async def answer_agent_question(plan_id: str, module: str, request: AnswerQuestionRequest):
+    """Provide an answer to a pending agent question."""
+    agent = get_agent(plan_id, module)
+    if not agent:
+        raise HTTPException(status_code=404, detail=f"No agent for module '{module}'")
+
+    ok = agent.answer_question(request.question_id, request.answer)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Question not found or already answered")
+
+    return {
+        "status": "answered",
+        "pending_questions": len(agent.pending_questions),
+        "agent_status": agent.status,
+    }
+
+
+@app.post("/api/plans/{plan_id}/agents/{module}/skip")
+async def skip_agent_question(plan_id: str, module: str, request: SkipQuestionRequest):
+    """Skip a pending agent question."""
+    agent = get_agent(plan_id, module)
+    if not agent:
+        raise HTTPException(status_code=404, detail=f"No agent for module '{module}'")
+
+    ok = agent.skip_question(request.question_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Question not found or already answered")
+
+    return {
+        "status": "skipped",
+        "pending_questions": len(agent.pending_questions),
+        "agent_status": agent.status,
+    }
+
+
+@app.post("/api/plans/{plan_id}/agents/{module}/generate")
+async def generate_agent_scenarios(plan_id: str, module: str):
+    """Trigger scenario generation for a specific agent."""
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    agent = get_agent(plan_id, module)
+    if not agent:
+        raise HTTPException(status_code=404, detail=f"No agent for module '{module}'")
+
+    # Find auth scenario id from the plan (for depends_on)
+    plan = PLANS[plan_id]
+    auth_scenario_id = "rec_001"
+    test_plan = plan.get("test_plan") or {}
+    auth_module = test_plan.get("modules", {}).get("auth", {})
+    auth_scenarios = auth_module.get("scenarios", [])
+    if auth_scenarios:
+        auth_scenario_id = auth_scenarios[0]["id"]
+
+    scenarios = agent.generate_scenarios(auth_scenario_id=auth_scenario_id)
+
+    return {
+        "status": "generated",
+        "module": module,
+        "scenarios_count": len(scenarios),
+        "scenarios": scenarios,
+    }
+
+
+@app.post("/api/plans/{plan_id}/agents/generate-all")
+async def generate_all_agent_scenarios(plan_id: str):
+    """Trigger scenario generation for all agents in the plan."""
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    agents = get_agents_for_plan(plan_id)
+    if not agents:
+        raise HTTPException(status_code=400, detail="No agents found — create agents first")
+
+    plan = PLANS[plan_id]
+    auth_scenario_id = "rec_001"
+
+    results = {}
+    for module, agent in agents.items():
+        try:
+            scenarios = agent.generate_scenarios(auth_scenario_id=auth_scenario_id)
+            results[module] = {"status": "generated", "count": len(scenarios)}
+        except Exception as e:
+            results[module] = {"status": "failed", "error": str(e)}
+
+    return {"status": "done", "plan_id": plan_id, "results": results}
+
+
+@app.post("/api/plans/{plan_id}/agents/merge")
+async def merge_agent_scenarios(plan_id: str):
+    """
+    Merge all agent-generated scenarios into the plan's test_plan.
+    Each agent's scenarios are placed in their own module.
+    Agents with no scenarios are skipped.
+    """
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    agents = get_agents_for_plan(plan_id)
+    if not agents:
+        raise HTTPException(status_code=400, detail="No agents found")
+
+    plan = PLANS[plan_id]
+    test_plan = plan.get("test_plan") or {
+        "base_url": plan["url"],
+        "total_scenarios": 0,
+        "modules": {},
+    }
+
+    total_added = 0
+    for module, agent in agents.items():
+        if not agent.scenarios:
+            continue
+        existing = test_plan["modules"].get(module, {})
+        existing_ids = {s["id"] for s in existing.get("scenarios", [])}
+
+        new_scenarios = [s for s in agent.scenarios if s["id"] not in existing_ids]
+        if module not in test_plan["modules"]:
+            test_plan["modules"][module] = {
+                "name": agent.display_name,
+                "requires_auth": module != "auth",
+                "scenarios": [],
+            }
+        test_plan["modules"][module]["scenarios"].extend(new_scenarios)
+        total_added += len(new_scenarios)
+
+    # Recount total
+    test_plan["total_scenarios"] = sum(
+        len(m.get("scenarios", [])) for m in test_plan["modules"].values()
+    )
+
+    plan["test_plan"] = test_plan
+    if plan.get("status") != "ready":
+        plan["status"] = "ready"
+    save_plans(PLANS)
+
+    return {
+        "status": "merged",
+        "plan_id": plan_id,
+        "scenarios_added": total_added,
+        "total_scenarios": test_plan["total_scenarios"],
+    }
+
+
+@app.post("/api/plans/{plan_id}/agents/run")
+async def run_agent_scenarios(plan_id: str, request: RunScenariosRequest, background_tasks: BackgroundTasks):
+    """
+    Generate + merge + run all agent scenarios in one shot.
+    Equivalent to: generate-all → merge → run.
+    """
+    if plan_id not in PLANS:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    agents = get_agents_for_plan(plan_id)
+    if not agents:
+        raise HTTPException(status_code=400, detail="No agents found — create agents first")
+
+    plan = PLANS[plan_id]
+
+    # Generate for any agent that hasn't yet
+    auth_scenario_id = "rec_001"
+    for agent in agents.values():
+        if not agent.scenarios:
+            agent.generate_scenarios(auth_scenario_id=auth_scenario_id)
+
+    # Merge into plan
+    test_plan = plan.get("test_plan") or {"base_url": plan["url"], "total_scenarios": 0, "modules": {}}
+    for module, agent in agents.items():
+        if not agent.scenarios:
+            continue
+        if module not in test_plan["modules"]:
+            test_plan["modules"][module] = {
+                "name": agent.display_name,
+                "requires_auth": module != "auth",
+                "scenarios": [],
+            }
+        existing_ids = {s["id"] for s in test_plan["modules"][module].get("scenarios", [])}
+        test_plan["modules"][module]["scenarios"].extend(
+            s for s in agent.scenarios if s["id"] not in existing_ids
+        )
+    test_plan["total_scenarios"] = sum(len(m.get("scenarios", [])) for m in test_plan["modules"].values())
+    plan["test_plan"] = test_plan
+    plan["status"] = "ready"
+    save_plans(PLANS)
+
+    # Collect all scenarios
+    all_scenarios = [
+        sc for m in test_plan["modules"].values() for sc in m.get("scenarios", [])
+    ]
+
+    credentials = None
+    if request.test_credentials:
+        credentials = {
+            "username": request.test_credentials.username,
+            "password": request.test_credentials.password,
+        }
+
+    run_id = str(uuid.uuid4())
+    RUNS[run_id] = {
+        "id": run_id,
+        "plan_id": plan_id,
+        "type": "agent_run",
+        "target_url": plan["url"],
+        "test_name": "Agent Run",
+        "scenarios": all_scenarios,
+        "test_credentials": credentials,
+        "status": "pending",
+        "results": {},
+        "created_at": datetime.now().isoformat(),
+    }
+    save_runs()
+
+    background_tasks.add_task(
+        run_scenarios_task, run_id, plan["url"], all_scenarios,
+        request.browser or "chromium", credentials,
+    )
+
+    return {
+        "run_id": run_id,
+        "status": "started",
+        "scenarios_count": len(all_scenarios),
+    }
+
+
+# =============================================================================
 async def execute_scenario(page, scenario: Dict, base_url: str) -> Dict:
     """Execute a single test scenario and return results."""
     from playwright.async_api import TimeoutError as PlaywrightTimeout
+    from src.utils.page_intelligence import (
+        dismiss_overlays_async, smart_find_async,
+        vision_find_async,
+    )
 
     scenario_result = {
         "id": scenario["id"],
@@ -1793,14 +2428,16 @@ async def execute_scenario(page, scenario: Dict, base_url: str) -> Dict:
                     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                     await page.wait_for_load_state("networkidle", timeout=10000)
                 except Exception:
-                    pass  # networkidle timeout is non-fatal
+                    pass
+                await dismiss_overlays_async(page, timeout_ms=3000)
 
             elif action == "fill":
-                selectors = target.split(", ")
+                step_desc = step.get("description", target)
+                selectors = [s.strip() for s in target.split(",") if s.strip()]
                 filled = False
                 for selector in selectors:
                     try:
-                        elem = await page.wait_for_selector(selector.strip(), state="visible", timeout=8000)
+                        elem = await page.wait_for_selector(selector, state="visible", timeout=5000)
                         if elem:
                             await elem.scroll_into_view_if_needed()
                             await elem.fill(value or "")
@@ -1808,15 +2445,45 @@ async def execute_scenario(page, scenario: Dict, base_url: str) -> Dict:
                             break
                     except:
                         continue
+
+                if not filled:
+                    # Layer 3: DOM intelligence
+                    smart_sel = await smart_find_async(page, step_desc, "fill")
+                    if smart_sel:
+                        try:
+                            elem = await page.wait_for_selector(smart_sel, state="visible", timeout=5000)
+                            if elem:
+                                await elem.scroll_into_view_if_needed()
+                                await elem.fill(value or "")
+                                filled = True
+                                step["target"] = smart_sel
+                        except:
+                            pass
+
+                if not filled:
+                    # Layer 4: Vision
+                    coords = await vision_find_async(page, step_desc)
+                    if coords:
+                        try:
+                            await page.mouse.click(*coords)
+                            await page.wait_for_timeout(150)
+                            await page.keyboard.select_all()
+                            await page.keyboard.type(value or "")
+                            filled = True
+                            step["target"] = f"vision:({coords[0]},{coords[1]})"
+                        except Exception as ve:
+                            print(f"[Executor] L4-vision fill failed: {ve}")
+
                 if not filled:
                     raise Exception(f"Could not find element: {target}")
 
             elif action == "click":
-                selectors = target.split(", ")
+                step_desc = step.get("description", target)
+                selectors = [s.strip() for s in target.split(",") if s.strip()]
                 clicked = False
                 for selector in selectors:
                     try:
-                        elem = await page.wait_for_selector(selector.strip(), state="visible", timeout=8000)
+                        elem = await page.wait_for_selector(selector, state="visible", timeout=5000)
                         if elem:
                             await elem.scroll_into_view_if_needed()
                             await elem.click()
@@ -1824,6 +2491,32 @@ async def execute_scenario(page, scenario: Dict, base_url: str) -> Dict:
                             break
                     except:
                         continue
+
+                if not clicked:
+                    # Layer 3: DOM intelligence
+                    smart_sel = await smart_find_async(page, step_desc, "click")
+                    if smart_sel:
+                        try:
+                            elem = await page.wait_for_selector(smart_sel, state="visible", timeout=5000)
+                            if elem:
+                                await elem.scroll_into_view_if_needed()
+                                await elem.click()
+                                clicked = True
+                                step["target"] = smart_sel
+                        except:
+                            pass
+
+                if not clicked:
+                    # Layer 4: Vision
+                    coords = await vision_find_async(page, step_desc)
+                    if coords:
+                        try:
+                            await page.mouse.click(*coords)
+                            clicked = True
+                            step["target"] = f"vision:({coords[0]},{coords[1]})"
+                        except Exception as ve:
+                            print(f"[Executor] L4-vision click failed: {ve}")
+
                 if not clicked:
                     raise Exception(f"Could not click element: {target}")
 
@@ -1838,27 +2531,36 @@ async def execute_scenario(page, scenario: Dict, base_url: str) -> Dict:
                 if target == "page_loaded":
                     assert await page.title(), "Page did not load"
                 elif target == "url_changed":
-                    # Check if login actually succeeded by looking for account indicators
                     current_url = page.url
-                    success_indicators = [
-                        ".account", ".header-links a[href*='logout']",
-                        ".header-links a[href*='account']", "[href*='customerinfo']",
-                        "a:has-text('Log out')", "a:has-text('Logout')",
-                        ".ico-logout", "[href*='logout']"
+                    _AUTH_URL_PATTERNS = [
+                        "login", "logon", "signin", "sign-in", "/auth/",
+                        "b2clogin.com", "login.microsoftonline.com",
+                        "accounts.google.com", "okta.com", "auth0.com",
                     ]
-                    found_success = False
-                    for sel in success_indicators:
-                        try:
-                            elem = await page.query_selector(sel)
-                            if elem and await elem.is_visible():
-                                found_success = True
-                                break
-                        except:
-                            continue
-                    # If still on login page and no success indicators, fail
-                    if 'login' in current_url.lower() and not found_success:
-                        assert False, "Login failed - still on login page"
-                    assert found_success, "Login success indicators not found"
+                    on_auth_page = any(p in current_url.lower() for p in _AUTH_URL_PATTERNS)
+
+                    if not on_auth_page:
+                        pass  # URL moved to app content — login succeeded
+                    else:
+                        success_indicators = [
+                            ".account", ".user-menu", ".avatar", ".profile",
+                            "[href*='logout']", "[href*='log-out']", "[href*='sign-out']", "[href*='signout']",
+                            ".header-links a[href*='logout']", ".header-links a[href*='account']",
+                            "[href*='customerinfo']", ".ico-logout",
+                            "a:has-text('Log out')", "a:has-text('Logout')", "a:has-text('Sign out')",
+                            "button:has-text('Sign Out')", "button:has-text('Log Out')",
+                            ".sidebar", ".dashboard-content", "[data-user]",
+                        ]
+                        found_success = False
+                        for sel in success_indicators:
+                            try:
+                                elem = await page.query_selector(sel)
+                                if elem and await elem.is_visible():
+                                    found_success = True
+                                    break
+                            except:
+                                continue
+                        assert found_success, f"Login failed — still on auth page: {current_url}"
                 elif target == "error_message_visible":
                     # Look for common error indicators including ASP.NET MVC validation
                     error_selectors = [
@@ -2564,17 +3266,26 @@ async def get_active_skills(plan_id: str):
         raise HTTPException(status_code=404, detail="Plan not found")
 
     from src.agents.skills_loader import get_skills_loader
+    from urllib.parse import urlparse
     plan = PLANS[plan_id]
     knowledge = plan.get("app_knowledge") or {}
 
+    # Fall back to URL hostname when app_knowledge hasn't been built yet
+    domain = knowledge.get("domain", "")
+    if not domain:
+        try:
+            domain = urlparse(plan.get("url", "")).hostname or ""
+        except Exception:
+            domain = ""
+
     active = get_skills_loader().get_active_skill_names(
-        domain=knowledge.get("domain", ""),
+        domain=domain,
         vocabulary=knowledge.get("domain_vocabulary", []),
         app_description=knowledge.get("app_description", ""),
     )
     return {
         "plan_id": plan_id,
-        "domain": knowledge.get("domain", ""),
+        "domain": domain,
         "active_skills": active,
     }
 
@@ -2603,6 +3314,119 @@ def _merge_scenario_modules(existing_plan: Dict, new_result: Dict) -> Dict:
         "modules": existing_modules,
         "total_scenarios": total,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# AUTONOMOUS EXPLORATION  — /api/autonomous/*  +  ws://…/ws/autonomous/{id}
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from src.agents.autonomous_explorer import AutonomousSession
+
+# In-memory store for active/recent sessions
+AUTONOMOUS_SESSIONS: Dict[str, AutonomousSession] = {}
+
+
+class StartAutonomousRequest(BaseModel):
+    url: str
+    max_pages: int = 25
+
+
+@app.post("/api/autonomous/start")
+async def start_autonomous_session(
+    request: StartAutonomousRequest,
+    background_tasks: BackgroundTasks,
+):
+    """Launch a new autonomous exploration session. Returns session_id immediately."""
+    session_id = str(uuid.uuid4())
+    session = AutonomousSession(session_id, request.url)
+    AUTONOMOUS_SESSIONS[session_id] = session
+    background_tasks.add_task(session.run, request.max_pages)
+    return {"session_id": session_id, "status": "started", "url": request.url}
+
+
+@app.get("/api/autonomous/{session_id}/status")
+async def get_autonomous_status(session_id: str):
+    """Poll for current session state (used as fallback when WS is unavailable)."""
+    session = AUTONOMOUS_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {
+        "session_id": session_id,
+        "status": session.status,
+        "agents": session.agents,
+        "event_count": len(session.events),
+        "page_count": len(session.page_map),
+        "latest_events": session.events[-20:],          # last 20 events
+        "pending_question": session._pending_question,
+        "summary": session.findings_summary,
+    }
+
+
+@app.post("/api/autonomous/{session_id}/answer")
+async def answer_autonomous_question(session_id: str, body: dict):
+    """Submit a user answer to a waiting agent question."""
+    session = AUTONOMOUS_SESSIONS.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    session.receive_answer(body.get("answer", "skip"))
+    return {"status": "ok", "answer": body.get("answer")}
+
+
+@app.delete("/api/autonomous/{session_id}")
+async def delete_autonomous_session(session_id: str):
+    session = AUTONOMOUS_SESSIONS.pop(session_id, None)
+    if session:
+        session.stop()   # signal browser to close gracefully
+    return {"status": "deleted"}
+
+
+@app.websocket("/ws/autonomous/{session_id}")
+async def autonomous_websocket(websocket: WebSocket, session_id: str):
+    """
+    WebSocket endpoint for real-time event streaming.
+
+    Server → Client:  event dicts (progress, screenshot, finding, question, done …)
+    Client → Server:  {"type": "answer", "answer": "…"}
+    """
+    await websocket.accept()
+    session = AUTONOMOUS_SESSIONS.get(session_id)
+    if not session:
+        await websocket.send_json({"type": "error", "message": "Session not found"})
+        await websocket.close()
+        return
+
+    # Replay all events emitted before this client connected
+    for event in list(session.events):
+        try:
+            await websocket.send_json(event)
+        except Exception:
+            break
+
+    # Register as a subscriber for new events
+    async def ws_send(event: dict):
+        try:
+            await websocket.send_json(event)
+        except Exception:
+            pass
+
+    session.subscribe(ws_send)
+
+    try:
+        while True:
+            try:
+                data = await asyncio.wait_for(websocket.receive_json(), timeout=30)
+                if isinstance(data, dict) and data.get("type") == "answer":
+                    session.receive_answer(data.get("answer", "skip"))
+            except asyncio.TimeoutError:
+                # Send a keepalive ping so the connection stays alive
+                try:
+                    await websocket.send_json({"type": "ping"})
+                except Exception:
+                    break
+    except WebSocketDisconnect:
+        pass
+    finally:
+        session.unsubscribe(ws_send)
 
 
 if __name__ == "__main__":

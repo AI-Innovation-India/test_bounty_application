@@ -6,7 +6,7 @@ import Sidebar from "@/components/Sidebar";
 import { listTestSuites, createTestSuite, updateTestSuite, deleteTestSuite, runTestSuite, listRuns, TestSuite, Run } from "@/lib/api";
 import {
     FileText, Plus, X, Trash2, Play, Clock, CheckCircle,
-    XCircle, MoreVertical, Edit2, Calendar, Loader2, ExternalLink
+    XCircle, MoreVertical, Edit2, Loader2, ExternalLink
 } from "lucide-react";
 
 export default function TestListsPage() {
@@ -65,8 +65,6 @@ export default function TestListsPage() {
             await createTestSuite({
                 name: formName,
                 description: formDescription,
-                tests: selectedTests,
-                schedule: formSchedule || undefined
             });
             await loadData();
             setShowCreateModal(false);
@@ -88,8 +86,6 @@ export default function TestListsPage() {
             await updateTestSuite(editingSuiteId, {
                 name: formName,
                 description: formDescription,
-                tests: selectedTests,
-                schedule: formSchedule || undefined
             });
             await loadData();
             setShowEditModal(false);
@@ -107,8 +103,8 @@ export default function TestListsPage() {
         setEditingSuiteId(suite.id);
         setFormName(suite.name);
         setFormDescription(suite.description || "");
-        setFormSchedule(suite.schedule || "");
-        setSelectedTests(suite.tests || []);
+        setFormSchedule("");
+        setSelectedTests([]);
         setShowEditModal(true);
         setOpenMenuId(null);
     };
@@ -133,7 +129,7 @@ export default function TestListsPage() {
             const result = await runTestSuite(suiteId);
             await loadData();
             setToast({
-                message: `Running "${suiteName}" with ${result.tests_count} tests. View in All Tests.`,
+                message: `Running "${suiteName}" — ${result.scenarios_count} scenarios queued.`,
                 type: "success"
             });
         } catch (e) {
@@ -238,14 +234,11 @@ export default function TestListsPage() {
                                             <div className="flex items-center gap-6 text-xs text-slate-500">
                                                 <span className="flex items-center gap-1">
                                                     <FileText size={12} />
-                                                    {suite.tests.length} tests
+                                                    {suite.scenario_refs?.length || 0} scenarios
                                                 </span>
-                                                {suite.schedule && (
-                                                    <span className="flex items-center gap-1">
-                                                        <Calendar size={12} />
-                                                        {suite.schedule}
-                                                    </span>
-                                                )}
+                                                <span className="flex items-center gap-1 px-1.5 py-0.5 rounded bg-white/5">
+                                                    {suite.suite_type}
+                                                </span>
                                                 {suite.last_run && (
                                                     <span className="flex items-center gap-1">
                                                         <Clock size={12} />

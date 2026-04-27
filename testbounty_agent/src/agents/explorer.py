@@ -15,6 +15,17 @@ from urllib.parse import urljoin, urlparse
 import re
 
 
+_SSO_DOMAINS = (
+    "b2clogin.com", "login.microsoftonline.com", "accounts.microsoft.com",
+    "login.microsoft.com", "okta.com", "auth0.com", "onelogin.com",
+    "accounts.google.com", "appleid.apple.com", "pingidentity.com",
+)
+
+
+def _is_sso_domain(netloc: str) -> bool:
+    return any(d in netloc for d in _SSO_DOMAINS)
+
+
 class ExplorerAgent:
     """
     Agent that explores an application and creates a complete map of:
@@ -33,6 +44,8 @@ class ExplorerAgent:
         self.pages: List[Dict] = []
         self.modules: Dict[str, Dict] = {}
         self.auth_pages: List[str] = []
+        self.sso_detected: bool = False
+        self.sso_provider: str = ""
         self.browser: Optional[Browser] = None
 
     def _check_robots_txt(self) -> bool:
@@ -108,7 +121,9 @@ class ExplorerAgent:
                 "total_pages": len(self.pages),
                 "pages": self.pages,
                 "modules": self.modules,
-                "auth_pages": self.auth_pages
+                "auth_pages": self.auth_pages,
+                "sso_detected": self.sso_detected,
+                "sso_provider": self.sso_provider,
             }
 
     def _explore_sync(self, max_pages: int = 50) -> Dict[str, Any]:
@@ -137,11 +152,19 @@ class ExplorerAgent:
             "total_pages": len(self.pages),
             "pages": self.pages,
             "modules": self.modules,
-            "auth_pages": self.auth_pages
+            "auth_pages": self.auth_pages,
+            "sso_detected": self.sso_detected,
+            "sso_provider": self.sso_provider,
         }
 
     async def _explore_page(self, page: Page, url: str, max_pages: int):
         """Explore a single page and discover its elements"""
+        from src.utils.page_intelligence import (
+            dismiss_overlays_async,
+            extract_real_form_fields_sync,
+            extract_submit_selector_sync,
+        )
+
         if url in self.visited_urls or len(self.visited_urls) >= max_pages:
             return
 
@@ -152,21 +175,67 @@ class ExplorerAgent:
         self.visited_urls.add(url)
 
         try:
-            response = await page.goto(url, wait_until='domcontentloaded', timeout=10000)
+            response = await page.goto(url, wait_until='domcontentloaded', timeout=15000)
             if not response:
                 return
 
-            await page.wait_for_timeout(1000)  # Wait for JS to load
+            await page.wait_for_timeout(1500)
 
-            # Extract page information
+            # ── Step 1: dismiss cookie consent / overlay modals ───────────────
+            dismissed = await dismiss_overlays_async(page, timeout_ms=3000)
+            if dismissed:
+                await page.wait_for_timeout(1500)
+
+            # ── Step 2: check where we landed ────────────────────────────────
+            landed = urlparse(page.url).netloc
+            if _is_sso_domain(landed):
+                self.sso_detected = True
+                self.sso_provider = landed
+                print(f"[Explorer] SSO redirect detected → {landed}. Extracting REAL selectors.")
+
+                real_fields = extract_real_form_fields_sync(page)
+                real_submit = extract_submit_selector_sync(page)
+                page_title = await page.title() or "Login / SSO"
+
+                form_fields = real_fields if real_fields else [
+                    {"name": "username", "type": "text",
+                     "selector": "input[name='loginfmt'], #i0116, input[type='email'], input[name='username']",
+                     "placeholder": "Email / Username", "required": True},
+                    {"name": "password", "type": "password",
+                     "selector": "input[name='passwd'], #i0118, input[type='password']",
+                     "placeholder": "Password", "required": True},
+                ]
+
+                login_page = {
+                    "url": url,
+                    "path": urlparse(url).path,
+                    "title": page_title,
+                    "type": "login",
+                    "requires_auth": False,
+                    "forms": [{
+                        "id": "sso_login",
+                        "action": url,
+                        "method": "post",
+                        "fields": form_fields,
+                        "submit_selector": real_submit,
+                        "submit_text": "Sign in",
+                    }],
+                    "buttons": [{"text": "Sign in", "type": "submit", "action": "submit"}],
+                    "inputs": [], "nav_links": [], "modals": [],
+                    "sso_provider": landed,
+                    "sso_url": page.url,
+                }
+                self.pages.append(login_page)
+                self.auth_pages.append(url)
+                return
+
+            # ── Step 3: extract real page info from DOM ───────────────────────
             page_info = await self._extract_page_info(page, url)
             self.pages.append(page_info)
 
-            # Check if this is an auth page
             if self._is_auth_page(page_info):
                 self.auth_pages.append(url)
 
-            # Find and explore linked pages
             links = await self._extract_links(page)
             for link in links:
                 full_url = urljoin(url, link)
@@ -550,6 +619,12 @@ class ExplorerAgent:
 
     def _explore_page_sync(self, page, url: str, max_pages: int):
         """Synchronous version of _explore_page for Windows"""
+        from src.utils.page_intelligence import (
+            dismiss_overlays_sync,
+            extract_real_form_fields_sync,
+            extract_submit_selector_sync,
+        )
+
         if url in self.visited_urls or len(self.visited_urls) >= max_pages:
             return
 
@@ -560,17 +635,71 @@ class ExplorerAgent:
         self.visited_urls.add(url)
 
         try:
-            response = page.goto(url, wait_until='domcontentloaded', timeout=10000)
+            response = page.goto(url, wait_until='domcontentloaded', timeout=15000)
             if not response:
                 return
 
-            page.wait_for_timeout(1000)  # Wait for JS to load
+            page.wait_for_timeout(1500)  # Wait for JS redirects to settle
 
-            # Extract page information
+            # ── Step 1: dismiss cookie consent / overlay modals ───────────────
+            dismissed = dismiss_overlays_sync(page, timeout_ms=3000)
+            if dismissed:
+                page.wait_for_timeout(1500)  # wait for redirect after consent
+
+            # ── Step 2: check where we landed after consent dismiss ───────────
+            landed = urlparse(page.url).netloc
+            if _is_sso_domain(landed):
+                self.sso_detected = True
+                self.sso_provider = landed
+                print(f"[Explorer] SSO redirect detected → {landed}. Extracting REAL selectors.")
+
+                # Extract real form fields from the live SSO page DOM
+                real_fields = extract_real_form_fields_sync(page)
+                real_submit = extract_submit_selector_sync(page)
+                page_title = page.title() or "Login / SSO"
+
+                # Build fields list using real extracted data, fall back to known patterns
+                if real_fields:
+                    form_fields = real_fields
+                else:
+                    form_fields = [
+                        {"name": "username", "type": "text",
+                         "selector": "input[name='loginfmt'], #i0116, input[type='email'], input[name='username']",
+                         "placeholder": "Email / Username", "required": True},
+                        {"name": "password", "type": "password",
+                         "selector": "input[name='passwd'], #i0118, input[type='password']",
+                         "placeholder": "Password", "required": True},
+                    ]
+
+                login_page = {
+                    "url": url,
+                    "path": urlparse(url).path,
+                    "title": page_title,
+                    "type": "login",
+                    "requires_auth": False,
+                    "forms": [{
+                        "id": "sso_login",
+                        "action": url,
+                        "method": "post",
+                        "fields": form_fields,
+                        "submit_selector": real_submit,
+                        "submit_text": "Sign in",
+                    }],
+                    "buttons": [{"text": "Sign in", "type": "submit", "action": "submit"}],
+                    "inputs": [],
+                    "nav_links": [],
+                    "modals": [],
+                    "sso_provider": landed,
+                    "sso_url": page.url,
+                }
+                self.pages.append(login_page)
+                self.auth_pages.append(url)
+                return
+
+            # ── Step 3: extract page information from the real DOM ─────────────
             page_info = self._extract_page_info_sync(page, url)
             self.pages.append(page_info)
 
-            # Check if this is an auth page
             if self._is_auth_page(page_info):
                 self.auth_pages.append(url)
 

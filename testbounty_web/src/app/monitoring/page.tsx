@@ -555,7 +555,7 @@ export default function MonitoringPage() {
                                 >
                                     <option value="">No linked suite</option>
                                     {suites.map(suite => (
-                                        <option key={suite.id} value={suite.id}>{suite.name} ({suite.tests.length} tests)</option>
+                                        <option key={suite.id} value={suite.id}>{suite.name} ({suite.scenario_refs?.length || 0} scenarios)</option>
                                     ))}
                                 </select>
                                 <p className="text-xs text-slate-500 mt-1">Run all tests in the suite on schedule</p>
